@@ -123,7 +123,17 @@ class CLI_Dashboard_Notice {
             });
         });";
         
-        wp_add_inline_script( 'jquery', $script );
+        // 1. Register a new, unique script handle. We name it 'cli-notice-dismiss-js'.
+        //    - The source URL is empty ('') because it's just a placeholder.
+        //    - We explicitly declare its dependency on 'jquery' in the array.
+        //    - The 'true' at the end tells WordPress to load it in the footer, which is a performance best practice.
+        wp_register_script( 'cli-notice-dismiss-js', '', [ 'jquery' ], false, true );
+
+        // 2. Tell WordPress to actually add our newly registered script to the page.
+        wp_enqueue_script( 'cli-notice-dismiss-js' );
+
+        // 3. Now, attach our inline JavaScript to our OWN handle, not the generic 'jquery' one.
+        wp_add_inline_script( 'cli-notice-dismiss-js', $script );
     }
     
     /**
@@ -458,7 +468,8 @@ class CLI_Notice_Command {
             CLI_Dashboard_Notice::cli_audit_log( "CLI bypass granted for: {$operation}", [
                 'bypass_method' => $allow_cli_flag ? 'flag' : 'environment',
                 'flag_present' => $allow_cli_flag,
-                'env_enabled' => $env_enabled
+                'env_enabled' => $env_enabled,
+                'security_implication' => 'Operation running without WordPress user permission check.',
             ] );
             return true;
         }
