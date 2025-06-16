@@ -47,7 +47,7 @@ This document provides instructions for installing, configuring, and using the *
 3. **Install the MU-plugin** by creating `cli-notice.php`:
 
 ```bash
-wget -O wp-content/mu-plugins/cli-notice.php https://github.com/centminmod/centminmod-mu-plugins/raw/mu-plugins/cli-notice.php
+wget -O wp-content/mu-plugins/cli-notice.php https://github.com/centminmod/centminmod-mu-plugins/raw/refs/heads/master/mu-plugins/cli-notice.php
 chown nginx:nginx wp-content/mu-plugins/cli-notice.php
 chmod 644 wp-content/mu-plugins/cli-notice.php
 ```
