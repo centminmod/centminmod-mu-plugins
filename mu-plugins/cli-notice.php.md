@@ -1,6 +1,6 @@
-# CLI Dashboard Notice README (v2.1.1)
+# CLI Dashboard Notice README (v2.2.0)
 
-This document provides instructions for installing, configuring, and using the **CLI Dashboard Notice** Must-Use plugin for WordPress. This tool enables you to add, update, and delete temporary admin dashboard notices entirely via WP‑CLI commands, with enhanced security, controlled CLI bypass for bulk operations, and comprehensive audit logging.
+This document provides instructions for installing, configuring, and using the **CLI Dashboard Notice** Must-Use plugin for WordPress. This tool enables you to manage **multiple dashboard notices** simultaneously via WP‑CLI commands, with enhanced security, controlled CLI bypass for bulk operations, and comprehensive audit logging.
 
 ![screenshot](screenshots/wp-plugin-cli-notice.png)
 
@@ -10,7 +10,7 @@ This document provides instructions for installing, configuring, and using the *
 
 * [Prerequisites](#prerequisites)
 * [Installation](#installation)
-* [What's New in v2.1.1](#whats-new-in-v211)
+* [What's New in v2.2.0](#whats-new-in-v220)
 * [Security Model](#security-model)
 * [CLI Bypass Features](#cli-bypass-features)
 * [Usage](#usage)
@@ -66,30 +66,31 @@ That's it! The plugin is active automatically and ready for secure use.
 
 ---
 
-## What's New in v2.1.1
+## What's New in v2.2.0
 
-### 🔓 **Controlled CLI Bypass**
-- **Dual Security Model**: Strict web security + controlled CLI access
-- **Explicit Bypass Flags**: `--allow-cli` flag for intentional security bypass
-- **Environment Variables**: `CLI_NOTICE_ENABLE=1` for bulk operations
-- **Read Operations**: Status checks work without bypass flags
+### 🔢 **Multiple Notice Management**
+- **Support up to 10 concurrent notices**: Each with individual ID, type, message, and expiration
+- **Auto-ID Assignment**: Automatically assigns next available ID when no `--id` specified
+- **Smart Gap Management**: Reuses IDs from deleted notices to prevent gaps
+- **Individual Control**: Each notice can be updated, deleted, or expire independently
 
-### 🔒 **Enhanced Security Controls**
-- **IP Restrictions**: Whitelist specific IPs for CLI operations
-- **Time Restrictions**: Business hours only mode
-- **Advanced Logging**: Comprehensive audit trail for all CLI operations
-- **Web Security Intact**: No changes to browser/AJAX security
+### 🎯 **Enhanced CLI Commands**
+- **Smart Interactive Delete**: `wp notice delete` lists all notices for easy selection
+- **Flexible ID Management**: Support both explicit `--id=X` and automatic assignment
+- **Comprehensive Status**: Shows all active notices or specific notice details
+- **Backward Compatibility**: Existing single-notice behavior fully preserved
 
-### 📊 **Comprehensive Audit System**
-- **Mandatory Logging**: All CLI operations automatically logged
-- **Rich Context**: User, system, IP, and operation details
-- **Multiple Destinations**: WordPress debug log + custom log files
-- **Security Monitoring**: Unauthorized access attempts tracked
+### 🚀 **Improved User Experience**
+- **No Accidental Deletions**: Interactive listing prevents mistakes
+- **Rich Notice Display**: Shows ID, type, message preview, and expiration status
+- **Automatic Discovery**: Easy identification of available notice IDs
+- **Legacy Support**: Seamless migration from single-notice installations
 
-### 🚀 **Bulk Operation Support**
-- **Multi-Site Management**: Easy bulk operations across hosted instances
-- **Automated Scripts**: Environment variable support for scripting
-- **Performance Optimized**: Cached operations for faster execution
+### 📊 **Enhanced Security & Logging**
+- **Notice ID Tracking**: All audit logs include specific notice IDs
+- **Individual Dismissal**: Each notice has its own secure dismissal mechanism
+- **Granular Management**: IP restrictions, time controls maintained per operation
+- **Complete Audit Trail**: Enhanced logging with notice-specific context
 
 ---
 
@@ -141,8 +142,11 @@ wp notice delete --allow-cli
 wp notice status
 ```
 ```bash
-wp notice add "🔧 Scheduled maintenance tonight at 2 AM EST" --type=warning --allow-cli
-Success: Notice added successfully. Type: warning
+wp notice add "🔧 Scheduled maintenance tonight at 4 AM EST" --type=warning --allow-cli
+Success: Notice added successfully. ID: 1, Type: warning
+
+wp notice add "🔧 Scheduled maintenance tonight at 8 AM EST" --type=warning --allow-cli
+Success: Notice added successfully. ID: 2, Type: warning
 ```
 
 #### Method 2: Environment Variable (Bulk Operations)
@@ -157,10 +161,13 @@ wp notice delete
 ```
 ```bash
 wp notice status
-Current Notice Status:
-Message: 🔧 Scheduled maintenance tonight at 2 AM EST
-Type: warning
-Expires: Never
+Active Notices (2 total):
+
+ID 1: [warning] 🔧 Scheduled maintenance tonight at 4 AM EST
+  Expires: Never
+
+ID 2: [warning] 🔧 Scheduled maintenance tonight at 8 AM EST
+  Expires: Never
 ```
 
 #### Method 3: WordPress Constants (Permanent)
@@ -203,68 +210,105 @@ define('CLI_NOTICE_LOG_FILE', '/var/log/cli-notices.log');
 
 ## Usage
 
-### Basic Commands
+### Multiple Notice Management
 
-#### `wp notice add`
+#### `wp notice add` - Create New Notices
 **Syntax:**
 ```bash
-wp notice add "Your message here" [--type=<type>] [--expires=<YYYY-MM-DD HH:MM:SS>] [--allow-cli]
+wp notice add "Your message here" [--type=<type>] [--expires=<YYYY-MM-DD HH:MM:SS>] [--id=<id>] [--allow-cli]
 ```
 
 **Examples:**
 ```bash
-# Basic notice with CLI bypass
-wp notice add "🔔 System maintenance scheduled" --allow-cli
+# Auto-assign next available ID
+wp notice add "🔔 System maintenance scheduled" --type=warning --allow-cli    # Gets ID 1
 
-# Success notice with expiration
-wp notice add "🎉 Deployment complete" --type=success --expires="2025-06-17 09:00:00" --allow-cli
+# Explicit ID assignment  
+wp notice add "📊 New feature deployed" --id=5 --type=success --allow-cli     # Uses ID 5
+
+# Multiple notices with expiration
+wp notice add "⚠️ Security update required" --type=error --expires="2025-06-17 18:00:00" --allow-cli
 
 # With environment variable (no flag needed)
 CLI_NOTICE_ENABLE=1 wp notice add "❌ Critical issue detected" --type=error
 ```
 
-#### `wp notice update`
+#### `wp notice update` - Modify Existing Notices
 **Syntax:**
 ```bash
-wp notice update "Updated message" [--type=<type>] [--expires=<YYYY-MM-DD HH:MM:SS>] [--clear-expiry] [--allow-cli]
+wp notice update "Updated message" [--type=<type>] [--expires=<YYYY-MM-DD HH:MM:SS>] [--clear-expiry] [--id=<id>] [--allow-cli]
 ```
 
 **Examples:**
 ```bash
-# Update message only
-wp notice update "🔄 Maintenance in progress" --allow-cli
+# Update specific notice by ID
+wp notice update "🔄 Maintenance in progress" --id=1 --allow-cli
 
-# Change type and clear expiration
-wp notice update "✅ Maintenance completed" --type=success --clear-expiry --allow-cli
+# Update with new type and clear expiration
+wp notice update "✅ Maintenance completed" --id=1 --type=success --clear-expiry --allow-cli
+
+# Interactive update (shows available notices if no ID specified)
+wp notice update "New message" --allow-cli
 ```
 
-#### `wp notice delete`
+#### `wp notice delete` - Smart Interactive Deletion
 **Syntax:**
 ```bash
-wp notice delete [--allow-cli]
+wp notice delete [--id=<id>] [--all] [--allow-cli]
 ```
 
 **Examples:**
 ```bash
-# Remove current notice
+# Interactive listing (shows all notices for selection)
 wp notice delete --allow-cli
 
-# With environment variable
-CLI_NOTICE_ENABLE=1 wp notice delete
+# Delete specific notice
+wp notice delete --id=1 --allow-cli
+
+# Delete all notices
+wp notice delete --all --allow-cli
 ```
 
-#### `wp notice status`
+**Interactive Output Example:**
+```
+Available notices to delete:
+
+ID 1: [warning] System maintenance scheduled (expires: 2025-06-17 02:00:00)
+ID 3: [success] Feature deployment complete (expires: never)
+ID 5: [error] Critical security issue (EXPIRED)
+
+Usage:
+  wp notice delete --id=X --allow-cli    # Delete specific notice
+  wp notice delete --all --allow-cli     # Delete all notices
+```
+
+#### `wp notice status` - View Notice Information
 **Syntax:**
 ```bash
-wp notice status
+wp notice status [--id=<id>]
 ```
 
-**Sample Output:**
+**Examples:**
+```bash
+# Show all active notices
+wp notice status
+
+# Show specific notice details
+wp notice status --id=1
 ```
-Current Notice Status:
-Message: 🎉 Deployment successful
-Type: success
-Expires: 2025-06-17 15:30:00 (2 hours remaining)
+
+**Sample Output (All Notices):**
+```
+Active Notices (3 total):
+
+ID 1: [warning] System maintenance scheduled
+  Expires: 2025-06-17 02:00:00 (5 hours remaining)
+
+ID 3: [success] Feature deployment complete  
+  Expires: Never
+
+ID 5: [error] Critical security issue
+  Expires: 2025-06-16 18:00:00 (EXPIRED - 2 hours ago)
 ```
 
 ### New Commands

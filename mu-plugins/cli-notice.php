@@ -2,11 +2,11 @@
 /**
  * Plugin Name: CLI Dashboard Notice
  * Plugin URI: https://github.com/centminmod/centminmod-mu-plugins
- * Description: Show a notice stored in WP-CLI options with enhanced security:
- *   - temp_cli_dashboard_notice
- *   - temp_cli_dashboard_notice_type
- *   - temp_cli_dashboard_notice_expires
- * Version: 2.1.1
+ * Description: Manage multiple dashboard notices via WP-CLI with enhanced security:
+ *   - Support for up to 10 concurrent notices with auto-ID assignment
+ *   - Individual expiration, types, and dismissal for each notice
+ *   - Backward compatible with existing single-notice installations
+ * Version: 2.2.0
  * Author: CLI
  * Author URI: https://centminmod.com
  * License: GPLv2 or later
@@ -24,10 +24,12 @@ if ( ! defined( 'ABSPATH' ) ) {
 class CLI_Dashboard_Notice {
     
     const OPTION_PREFIX = 'temp_cli_dashboard_notice';
+    const INDEX_OPTION = 'temp_cli_dashboard_notice_next_id';
     const MAX_MESSAGE_LENGTH = 1000;
     const VALID_TYPES = [ 'info', 'success', 'warning', 'error' ];
     const DATE_BUFFER_SECONDS = 60;
     const MIN_TIME_DISPLAY_THRESHOLD = 300;
+    const MAX_NOTICES = 10;
     
     /**
      * Cached options to prevent multiple database calls
@@ -80,7 +82,79 @@ class CLI_Dashboard_Notice {
     }
     
     /**
-     * Get cached options to improve performance
+     * Get all active notices
+     *
+     * @return array Array of notices with their IDs
+     */
+    public static function get_all_notices() {
+        $notices = [];
+        
+        // Check for legacy single notice first
+        $legacy_message = get_option( self::OPTION_PREFIX );
+        if ( $legacy_message !== false ) {
+            $notices[0] = [
+                'id' => 0,
+                'message' => $legacy_message,
+                'type' => get_option( self::OPTION_PREFIX . '_type', 'warning' ),
+                'expires' => get_option( self::OPTION_PREFIX . '_expires' )
+            ];
+        }
+        
+        // Check for indexed notices
+        for ( $i = 1; $i <= self::MAX_NOTICES; $i++ ) {
+            $message = get_option( self::OPTION_PREFIX . '_' . $i );
+            if ( $message !== false ) {
+                $notices[$i] = [
+                    'id' => $i,
+                    'message' => $message,
+                    'type' => get_option( self::OPTION_PREFIX . '_' . $i . '_type', 'warning' ),
+                    'expires' => get_option( self::OPTION_PREFIX . '_' . $i . '_expires' )
+                ];
+            }
+        }
+        
+        return $notices;
+    }
+    
+    /**
+     * Get next available notice ID
+     *
+     * @return int Next available ID
+     */
+    public static function get_next_id() {
+        $next_id = get_option( self::INDEX_OPTION, 1 );
+        
+        // Find first available slot (handle gaps from deleted notices)
+        for ( $i = $next_id; $i <= self::MAX_NOTICES; $i++ ) {
+            if ( get_option( self::OPTION_PREFIX . '_' . $i ) === false ) {
+                return $i;
+            }
+        }
+        
+        // If no gaps found, check from beginning
+        for ( $i = 1; $i < $next_id; $i++ ) {
+            if ( get_option( self::OPTION_PREFIX . '_' . $i ) === false ) {
+                return $i;
+            }
+        }
+        
+        return false; // No available slots
+    }
+    
+    /**
+     * Update next ID counter
+     *
+     * @param int $used_id ID that was just used
+     */
+    public static function update_next_id( $used_id ) {
+        $current_next = get_option( self::INDEX_OPTION, 1 );
+        if ( $used_id >= $current_next ) {
+            update_option( self::INDEX_OPTION, $used_id + 1 );
+        }
+    }
+    
+    /**
+     * Get cached options to improve performance (legacy compatibility)
      */
     private static function get_cached_options() {
         if ( self::$cached_options === null ) {
@@ -108,8 +182,8 @@ class CLI_Dashboard_Notice {
             return;
         }
         
-        $options = self::get_cached_options();
-        if ( $options['message'] === false ) {
+        $all_notices = self::get_all_notices();
+        if ( empty( $all_notices ) ) {
             return;
         }
         
@@ -117,12 +191,15 @@ class CLI_Dashboard_Notice {
         $script = "
         jQuery(document).ready(function($) {
             $('.cli-dashboard-notice').on('click', '.notice-dismiss', function(e) {
-                var nonce = $(this).closest('.cli-dashboard-notice').data('nonce');
-                if (!nonce) return;
+                var \$notice = $(this).closest('.cli-dashboard-notice');
+                var nonce = \$notice.data('nonce');
+                var noticeId = \$notice.data('notice-id');
+                if (!nonce || noticeId === undefined) return;
                 
                 $.post(ajaxurl, {
                     action: 'cli_notice_dismiss',
-                    nonce: nonce
+                    nonce: nonce,
+                    notice_id: noticeId
                 });
             });
         });";
@@ -144,9 +221,12 @@ class CLI_Dashboard_Notice {
      * AJAX handler for notice dismissal with enhanced security
      */
     public static function ajax_dismiss_notice() {
-        // Enhanced nonce verification
+        // Get notice ID from request
+        $notice_id = intval( $_POST['notice_id'] ?? 0 );
+        
+        // Enhanced nonce verification with notice ID
         $nonce = sanitize_text_field( $_POST['nonce'] ?? '' );
-        if ( empty( $nonce ) || ! wp_verify_nonce( $nonce, 'cli_notice_dismiss' ) ) {
+        if ( empty( $nonce ) || ! wp_verify_nonce( $nonce, 'cli_notice_dismiss_' . $notice_id ) ) {
             wp_send_json_error( __( 'Security check failed.', 'cli-dashboard-notice' ) );
             return;
         }
@@ -157,14 +237,14 @@ class CLI_Dashboard_Notice {
             return;
         }
         
-        // Clean up notice
-        self::cleanup_options();
+        // Clean up specific notice
+        self::cleanup_notice_by_id( $notice_id );
         
         wp_send_json_success();
     }
     
     /**
-     * Display admin notice with enhanced security
+     * Display admin notices with enhanced security
      */
     public static function display_admin_notice() {
         // Check user capabilities
@@ -172,36 +252,48 @@ class CLI_Dashboard_Notice {
             return;
         }
         
-        $options = self::get_cached_options();
+        $all_notices = self::get_all_notices();
+        $expired_notices = [];
         
-        // Auto-expire logic with proper validation
-        if ( $options['expires'] ) {
-            $expire_timestamp = self::validate_and_parse_date( $options['expires'] );
-            if ( $expire_timestamp === false || time() > $expire_timestamp ) {
-                self::cleanup_options();
-                return;
+        foreach ( $all_notices as $notice_id => $notice ) {
+            // Auto-expire logic with proper validation
+            if ( $notice['expires'] ) {
+                $expire_timestamp = self::validate_and_parse_date( $notice['expires'] );
+                if ( $expire_timestamp === false || time() > $expire_timestamp ) {
+                    $expired_notices[] = $notice_id;
+                    continue;
+                }
+            }
+            
+            // Get and validate message
+            $message = $notice['message'];
+            if ( empty( $message ) ) {
+                continue;
+            }
+            
+            // Get and validate notice type
+            $type = self::validate_notice_type( $notice['type'] );
+            
+            // Generate nonce for AJAX dismissal
+            $nonce = wp_create_nonce( 'cli_notice_dismiss_' . $notice_id );
+            
+            // Output notice with proper escaping and nonce
+            printf(
+                '<div class="notice notice-%1$s is-dismissible cli-dashboard-notice" data-nonce="%4$s" data-notice-id="%5$s"><p>%2$s %3$s</p></div>',
+                esc_attr( $type ),
+                wp_kses( $message, self::get_allowed_html() ),
+                $notice_id > 0 ? '<small>(ID: ' . esc_html( $notice_id ) . ')</small>' : '',
+                esc_attr( $nonce ),
+                esc_attr( $notice_id )
+            );
+        }
+        
+        // Clean up expired notices
+        if ( ! empty( $expired_notices ) ) {
+            foreach ( $expired_notices as $notice_id ) {
+                self::cleanup_notice_by_id( $notice_id );
             }
         }
-        
-        // Get and validate message
-        $message = $options['message'];
-        if ( empty( $message ) ) {
-            return;
-        }
-        
-        // Get and validate notice type
-        $type = self::validate_notice_type( $options['type'] );
-        
-        // Generate nonce for AJAX dismissal
-        $nonce = wp_create_nonce( 'cli_notice_dismiss' );
-        
-        // Output notice with proper escaping and nonce
-        printf(
-            '<div class="notice notice-%1$s is-dismissible cli-dashboard-notice" data-nonce="%3$s"><p>%2$s</p></div>',
-            esc_attr( $type ),
-            wp_kses( $message, self::get_allowed_html() ),
-            esc_attr( $nonce )
-        );
     }
     
     /**
@@ -260,14 +352,26 @@ class CLI_Dashboard_Notice {
     }
     
     /**
-     * Clean up all plugin options
+     * Clean up specific notice by ID
+     *
+     * @param int $notice_id Notice ID to clean up (0 for legacy notice)
      */
-    public static function cleanup_options() {
-        $options = [
-            self::OPTION_PREFIX,
-            self::OPTION_PREFIX . '_type',
-            self::OPTION_PREFIX . '_expires',
-        ];
+    public static function cleanup_notice_by_id( $notice_id ) {
+        if ( $notice_id === 0 ) {
+            // Legacy single notice
+            $options = [
+                self::OPTION_PREFIX,
+                self::OPTION_PREFIX . '_type',
+                self::OPTION_PREFIX . '_expires',
+            ];
+        } else {
+            // Indexed notice
+            $options = [
+                self::OPTION_PREFIX . '_' . $notice_id,
+                self::OPTION_PREFIX . '_' . $notice_id . '_type',
+                self::OPTION_PREFIX . '_' . $notice_id . '_expires',
+            ];
+        }
         
         foreach ( $options as $option ) {
             delete_option( $option );
@@ -278,7 +382,30 @@ class CLI_Dashboard_Notice {
         
         // Optional logging - disabled by default, enable via filter
         if ( apply_filters( 'cli_dashboard_notice_enable_logging', false ) && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
-            error_log( __( 'CLI Dashboard Notice: Options cleaned up', 'cli-dashboard-notice' ) );
+            error_log( sprintf( __( 'CLI Dashboard Notice: Notice ID %d cleaned up', 'cli-dashboard-notice' ), $notice_id ) );
+        }
+    }
+    
+    /**
+     * Clean up all plugin options
+     */
+    public static function cleanup_options() {
+        // Clean up legacy notice
+        self::cleanup_notice_by_id( 0 );
+        
+        // Clean up all indexed notices
+        for ( $i = 1; $i <= self::MAX_NOTICES; $i++ ) {
+            if ( get_option( self::OPTION_PREFIX . '_' . $i ) !== false ) {
+                self::cleanup_notice_by_id( $i );
+            }
+        }
+        
+        // Clean up index counter
+        delete_option( self::INDEX_OPTION );
+        
+        // Optional logging - disabled by default, enable via filter
+        if ( apply_filters( 'cli_dashboard_notice_enable_logging', false ) && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
+            error_log( __( 'CLI Dashboard Notice: All options cleaned up', 'cli-dashboard-notice' ) );
         }
     }
     
@@ -397,30 +524,42 @@ class CLI_Dashboard_Notice {
 CLI_Dashboard_Notice::init();
 
 /**
- * Manage temporary admin notices with enhanced security and controlled CLI bypass.
+ * Manage multiple temporary admin notices with enhanced security and controlled CLI bypass.
  *
  * ## EXAMPLES
  *
- *     # CLI operations with bypass flag
- *     wp notice add "🔔 Hello world" --type=info --allow-cli
- *     wp notice update "✅ Done" --allow-cli
- *     wp notice delete --allow-cli
- *     wp notice status                    # Read operations don't need --allow-cli
- *     wp notice cleanup --allow-cli
- *     wp notice security_status          # Check security configuration
+ *     # Multiple notice management with auto-ID assignment
+ *     wp notice add "🔔 Maintenance tonight" --type=warning --allow-cli    # Auto-assigns ID 1
+ *     wp notice add "📊 New feature deployed" --type=success --allow-cli   # Auto-assigns ID 2
+ *     wp notice add "⚠️ Security update" --id=5 --type=info --allow-cli    # Explicit ID
+ *     
+ *     # Update specific notices
+ *     wp notice update "✅ Maintenance completed" --id=1 --type=success --allow-cli
+ *     
+ *     # Interactive delete (lists all notices)
+ *     wp notice delete --allow-cli                    # Shows all notices with deletion instructions
+ *     wp notice delete --id=1 --allow-cli            # Delete specific notice
+ *     wp notice delete --all --allow-cli             # Delete all notices
+ *     
+ *     # Status and management
+ *     wp notice status                                # Show all active notices (no flag needed)
+ *     wp notice status --id=1                        # Show specific notice details
+ *     wp notice security_status                      # Check security configuration
  *
- *     # With environment variable (for bulk operations)
- *     CLI_NOTICE_ENABLE=1 wp notice add "🔔 Hello world" --type=info
+ *     # Bulk operations with environment variable
+ *     CLI_NOTICE_ENABLE=1 wp notice add "🔔 Bulk notice 1" --type=info
+ *     CLI_NOTICE_ENABLE=1 wp notice add "🔔 Bulk notice 2" --type=warning
  *
- *     # Web operations unchanged (secure)
- *     # AJAX dismissal still requires proper nonce and user permissions
+ *     # Legacy single notice compatibility maintained
+ *     # Existing single-notice behavior still works
  *
  * ## SECURITY
  *
  *     Web operations: STRICT - Always require manage_options capability
  *     CLI read operations: ALLOWED - Status checks work without flags  
  *     CLI write operations: CONTROLLED - Require --allow-cli flag or CLI_NOTICE_ENABLE=1
- *     All CLI operations: LOGGED - Comprehensive audit trail
+ *     All CLI operations: LOGGED - Comprehensive audit trail with notice IDs
+ *     Multiple notices: Each notice has individual expiration and dismissal
  */
 class CLI_Notice_Command {
     
@@ -614,38 +753,36 @@ class CLI_Notice_Command {
         }
     }
     
-    /**
-     * Atomic check and update for notice existence to prevent race conditions
-     *
-     * @param string $operation 'add' or 'update'
-     * @return true|WP_Error
-     */
-    private function atomic_notice_check( $operation ) {
-        $existing_notice = get_option( CLI_Dashboard_Notice::OPTION_PREFIX );
-        
-        if ( $operation === 'add' && $existing_notice !== false ) {
-            return new WP_Error( 'notice_exists', __( 'A notice already exists. Use "wp notice update" to modify it or "wp notice delete" to remove it first.', 'cli-dashboard-notice' ) );
-        }
-        
-        if ( $operation === 'update' && $existing_notice === false ) {
-            return new WP_Error( 'no_notice_exists', __( 'No notice exists to update. Use "wp notice add" to create one.', 'cli-dashboard-notice' ) );
-        }
-        
-        return true;
-    }
     
     /**
      * Add a new dashboard notice.
      *
-     * @synopsis <message> [--type=<type>] [--expires=<expires>] [--allow-cli]
+     * @synopsis <message> [--type=<type>] [--expires=<expires>] [--id=<id>] [--allow-cli]
      */
     public function add( $args, $assoc ) {
         $permission_check = $this->check_permissions( 'add', $assoc );
         $this->handle_result( $permission_check );
         
-        // Atomic check for existing notice
-        $existence_check = $this->atomic_notice_check( 'add' );
-        $this->handle_result( $existence_check );
+        // Determine notice ID
+        $notice_id = isset( $assoc['id'] ) ? intval( $assoc['id'] ) : null;
+        
+        if ( $notice_id === null ) {
+            // Auto-assign next available ID
+            $notice_id = CLI_Dashboard_Notice::get_next_id();
+            if ( $notice_id === false ) {
+                WP_CLI::error( sprintf( __( 'Maximum number of notices (%d) exceeded.', 'cli-dashboard-notice' ), CLI_Dashboard_Notice::MAX_NOTICES ) );
+            }
+        } else {
+            // Validate explicit ID
+            if ( $notice_id < 1 || $notice_id > CLI_Dashboard_Notice::MAX_NOTICES ) {
+                WP_CLI::error( sprintf( __( 'Notice ID must be between 1 and %d.', 'cli-dashboard-notice' ), CLI_Dashboard_Notice::MAX_NOTICES ) );
+            }
+            
+            // Check if ID already exists
+            if ( get_option( CLI_Dashboard_Notice::OPTION_PREFIX . '_' . $notice_id ) !== false ) {
+                WP_CLI::error( sprintf( __( 'Notice with ID %d already exists. Use "update" to modify it or choose a different ID.', 'cli-dashboard-notice' ), $notice_id ) );
+            }
+        }
         
         // Validate and sanitize input
         $message = implode( ' ', $args );
@@ -668,22 +805,26 @@ class CLI_Notice_Command {
             }
         }
         
-        // Store the notice using WordPress functions directly
-        $success = update_option( CLI_Dashboard_Notice::OPTION_PREFIX, $validated_message );
+        // Store the notice using indexed options
+        $success = update_option( CLI_Dashboard_Notice::OPTION_PREFIX . '_' . $notice_id, $validated_message );
         if ( ! $success ) {
             WP_CLI::error( __( 'Failed to save notice message.', 'cli-dashboard-notice' ) );
         }
         
-        update_option( CLI_Dashboard_Notice::OPTION_PREFIX . '_type', $type );
+        update_option( CLI_Dashboard_Notice::OPTION_PREFIX . '_' . $notice_id . '_type', $type );
         
         if ( $expires ) {
-            update_option( CLI_Dashboard_Notice::OPTION_PREFIX . '_expires', $expires );
+            update_option( CLI_Dashboard_Notice::OPTION_PREFIX . '_' . $notice_id . '_expires', $expires );
         }
         
-        WP_CLI::success( sprintf( __( 'Notice added successfully. Type: %s', 'cli-dashboard-notice' ), $type ) );
+        // Update next ID counter
+        CLI_Dashboard_Notice::update_next_id( $notice_id );
+        
+        WP_CLI::success( sprintf( __( 'Notice added successfully. ID: %d, Type: %s', 'cli-dashboard-notice' ), $notice_id, $type ) );
         
         // CLI audit logging
         CLI_Dashboard_Notice::cli_audit_log( 'Notice added', [
+            'notice_id' => $notice_id,
             'type' => $type,
             'expires' => $expires ?: 'never',
             'message_length' => strlen( $message ),
@@ -694,22 +835,50 @@ class CLI_Notice_Command {
     /**
      * Update an existing dashboard notice.
      *
-     * @synopsis <message> [--type=<type>] [--expires=<expires>] [--clear-expiry] [--allow-cli]
+     * @synopsis <message> [--type=<type>] [--expires=<expires>] [--clear-expiry] [--id=<id>] [--allow-cli]
      */
     public function update( $args, $assoc ) {
         $permission_check = $this->check_permissions( 'update', $assoc );
         $this->handle_result( $permission_check );
         
-        // Atomic check for existing notice
-        $existence_check = $this->atomic_notice_check( 'update' );
-        $this->handle_result( $existence_check );
+        // Determine notice ID to update
+        $notice_id = isset( $assoc['id'] ) ? intval( $assoc['id'] ) : null;
+        
+        if ( $notice_id === null ) {
+            // If no ID specified, try legacy single notice first, then show available notices
+            if ( get_option( CLI_Dashboard_Notice::OPTION_PREFIX ) !== false ) {
+                $notice_id = 0; // Legacy notice
+            } else {
+                // Show available notices
+                $all_notices = CLI_Dashboard_Notice::get_all_notices();
+                if ( empty( $all_notices ) ) {
+                    WP_CLI::error( __( 'No notices found to update.', 'cli-dashboard-notice' ) );
+                }
+                
+                WP_CLI::log( __( 'Multiple notices found. Specify which one to update:', 'cli-dashboard-notice' ) );
+                foreach ( $all_notices as $id => $notice ) {
+                    $preview = strlen( $notice['message'] ) > 50 ? substr( $notice['message'], 0, 50 ) . '...' : $notice['message'];
+                    WP_CLI::log( sprintf( 'ID %d: [%s] %s', $id, $notice['type'], $preview ) );
+                }
+                WP_CLI::log( '' );
+                WP_CLI::log( __( 'Usage: wp notice update "new message" --id=X --allow-cli', 'cli-dashboard-notice' ) );
+                return;
+            }
+        }
+        
+        // Check if notice exists
+        $option_key = $notice_id === 0 ? CLI_Dashboard_Notice::OPTION_PREFIX : CLI_Dashboard_Notice::OPTION_PREFIX . '_' . $notice_id;
+        if ( get_option( $option_key ) === false ) {
+            WP_CLI::error( sprintf( __( 'Notice with ID %d does not exist.', 'cli-dashboard-notice' ), $notice_id ) );
+        }
         
         // Validate and sanitize input
         $message = implode( ' ', $args );
         $validated_message = CLI_Dashboard_Notice::validate_message( $message );
         $this->handle_result( $validated_message );
         
-        $type = $assoc['type'] ?? get_option( CLI_Dashboard_Notice::OPTION_PREFIX . '_type', 'warning' );
+        $type_key = $notice_id === 0 ? CLI_Dashboard_Notice::OPTION_PREFIX . '_type' : CLI_Dashboard_Notice::OPTION_PREFIX . '_' . $notice_id . '_type';
+        $type = $assoc['type'] ?? get_option( $type_key, 'warning' );
         if ( ! in_array( $type, CLI_Dashboard_Notice::VALID_TYPES, true ) ) {
             WP_CLI::error( sprintf( 
                 __( 'Invalid notice type. Must be one of: %s', 'cli-dashboard-notice' ), 
@@ -729,19 +898,21 @@ class CLI_Notice_Command {
         }
         
         // Update the notice
-        update_option( CLI_Dashboard_Notice::OPTION_PREFIX, $validated_message );
-        update_option( CLI_Dashboard_Notice::OPTION_PREFIX . '_type', $type );
+        update_option( $option_key, $validated_message );
+        update_option( $type_key, $type );
         
+        $expires_key = $notice_id === 0 ? CLI_Dashboard_Notice::OPTION_PREFIX . '_expires' : CLI_Dashboard_Notice::OPTION_PREFIX . '_' . $notice_id . '_expires';
         if ( $expires ) {
-            update_option( CLI_Dashboard_Notice::OPTION_PREFIX . '_expires', $expires );
+            update_option( $expires_key, $expires );
         } elseif ( $clear_expiry ) {
-            delete_option( CLI_Dashboard_Notice::OPTION_PREFIX . '_expires' );
+            delete_option( $expires_key );
         }
         
-        WP_CLI::success( sprintf( __( 'Notice updated successfully. Type: %s', 'cli-dashboard-notice' ), $type ) );
+        WP_CLI::success( sprintf( __( 'Notice updated successfully. ID: %s, Type: %s', 'cli-dashboard-notice' ), $notice_id === 0 ? 'legacy' : $notice_id, $type ) );
         
         // CLI audit logging
         CLI_Dashboard_Notice::cli_audit_log( 'Notice updated', [
+            'notice_id' => $notice_id,
             'type' => $type,
             'expires' => $expires ?: ( $clear_expiry ? 'cleared' : 'unchanged' ),
             'message_length' => strlen( $message ),
@@ -750,40 +921,98 @@ class CLI_Notice_Command {
     }
     
     /**
-     * Delete the dashboard notice.
+     * Delete dashboard notice(s).
      *
-     * @synopsis [--allow-cli]
+     * @synopsis [--id=<id>] [--all] [--allow-cli]
      */
     public function delete( $args, $assoc ) {
         $permission_check = $this->check_permissions( 'delete', $assoc );
         $this->handle_result( $permission_check );
         
-        $options = [
-            CLI_Dashboard_Notice::OPTION_PREFIX,
-            CLI_Dashboard_Notice::OPTION_PREFIX . '_type',
-            CLI_Dashboard_Notice::OPTION_PREFIX . '_expires',
-        ];
+        $notice_id = isset( $assoc['id'] ) ? intval( $assoc['id'] ) : null;
+        $delete_all = isset( $assoc['all'] );
+        
+        // If no flags provided, show interactive listing
+        if ( $notice_id === null && ! $delete_all ) {
+            $all_notices = CLI_Dashboard_Notice::get_all_notices();
+            
+            if ( empty( $all_notices ) ) {
+                WP_CLI::success( __( 'No notices found to delete.', 'cli-dashboard-notice' ) );
+                return;
+            }
+            
+            WP_CLI::log( __( 'Available notices to delete:', 'cli-dashboard-notice' ) );
+            WP_CLI::log( '' );
+            
+            foreach ( $all_notices as $id => $notice ) {
+                $expires_info = '';
+                if ( $notice['expires'] ) {
+                    $expire_timestamp = CLI_Dashboard_Notice::validate_and_parse_date_public( $notice['expires'] );
+                    if ( $expire_timestamp !== false ) {
+                        $time_remaining = $expire_timestamp - time();
+                        if ( $time_remaining > 0 ) {
+                            $expires_info = sprintf( ' (expires: %s)', $notice['expires'] );
+                        } else {
+                            $expires_info = ' (EXPIRED)';
+                        }
+                    }
+                } else {
+                    $expires_info = ' (expires: never)';
+                }
+                
+                $preview = strlen( $notice['message'] ) > 60 ? substr( $notice['message'], 0, 60 ) . '...' : $notice['message'];
+                WP_CLI::log( sprintf( 'ID %s: [%s] %s%s', 
+                    $id === 0 ? 'legacy' : $id, 
+                    $notice['type'], 
+                    $preview,
+                    $expires_info
+                ) );
+            }
+            
+            WP_CLI::log( '' );
+            WP_CLI::log( __( 'Usage:', 'cli-dashboard-notice' ) );
+            WP_CLI::log( __( '  wp notice delete --id=X --allow-cli    # Delete specific notice', 'cli-dashboard-notice' ) );
+            WP_CLI::log( __( '  wp notice delete --all --allow-cli     # Delete all notices', 'cli-dashboard-notice' ) );
+            return;
+        }
         
         $deleted_count = 0;
-        foreach ( $options as $option ) {
-            if ( get_option( $option ) !== false ) {
-                if ( delete_option( $option ) ) {
-                    $deleted_count++;
-                    WP_CLI::success( sprintf( __( "Deleted '%s' option.", 'cli-dashboard-notice' ), $option ) );
-                } else {
-                    WP_CLI::warning( sprintf( __( "Failed to delete '%s' option.", 'cli-dashboard-notice' ), $option ) );
-                }
+        
+        if ( $delete_all ) {
+            // Delete all notices
+            $all_notices = CLI_Dashboard_Notice::get_all_notices();
+            
+            foreach ( $all_notices as $id => $notice ) {
+                CLI_Dashboard_Notice::cleanup_notice_by_id( $id );
+                $deleted_count++;
+                WP_CLI::success( sprintf( __( 'Deleted notice ID %s.', 'cli-dashboard-notice' ), $id === 0 ? 'legacy' : $id ) );
             }
+            
+            // Clean up index counter
+            delete_option( CLI_Dashboard_Notice::INDEX_OPTION );
+            
+        } else {
+            // Delete specific notice
+            $option_key = $notice_id === 0 ? CLI_Dashboard_Notice::OPTION_PREFIX : CLI_Dashboard_Notice::OPTION_PREFIX . '_' . $notice_id;
+            
+            if ( get_option( $option_key ) === false ) {
+                WP_CLI::error( sprintf( __( 'Notice with ID %d does not exist.', 'cli-dashboard-notice' ), $notice_id ) );
+            }
+            
+            CLI_Dashboard_Notice::cleanup_notice_by_id( $notice_id );
+            $deleted_count = 1;
+            WP_CLI::success( sprintf( __( 'Deleted notice ID %s.', 'cli-dashboard-notice' ), $notice_id === 0 ? 'legacy' : $notice_id ) );
         }
         
         if ( $deleted_count === 0 ) {
             WP_CLI::warning( __( 'No notice options found to delete.', 'cli-dashboard-notice' ) );
         } else {
-            WP_CLI::success( __( 'Notice removal complete.', 'cli-dashboard-notice' ) );
+            WP_CLI::success( sprintf( __( 'Notice deletion complete. Removed %d notice(s).', 'cli-dashboard-notice' ), $deleted_count ) );
             
             // CLI audit logging
             CLI_Dashboard_Notice::cli_audit_log( 'Notice deleted', [
-                'options_removed' => $deleted_count,
+                'notice_id' => $delete_all ? 'all' : $notice_id,
+                'deleted_count' => $deleted_count,
                 'user_id' => get_current_user_id()
             ] );
         }
@@ -792,50 +1021,97 @@ class CLI_Notice_Command {
     /**
      * Show current notice status and details.
      *
-     * @synopsis [--allow-cli]
+     * @synopsis [--id=<id>] [--allow-cli]
      */
     public function status( $args, $assoc ) {
         // Status is a read operation - always allowed in CLI
         $permission_check = $this->check_permissions( 'status', $assoc );
         $this->handle_result( $permission_check );
         
-        $message = get_option( CLI_Dashboard_Notice::OPTION_PREFIX );
+        $notice_id = isset( $assoc['id'] ) ? intval( $assoc['id'] ) : null;
         
-        if ( $message === false ) {
-            WP_CLI::success( __( 'No active notice.', 'cli-dashboard-notice' ) );
-            return;
-        }
-        
-        $type = get_option( CLI_Dashboard_Notice::OPTION_PREFIX . '_type', 'warning' );
-        $expires = get_option( CLI_Dashboard_Notice::OPTION_PREFIX . '_expires' );
-        
-        WP_CLI::log( __( 'Current Notice Status:', 'cli-dashboard-notice' ) );
-        WP_CLI::log( sprintf( __( 'Message: %s', 'cli-dashboard-notice' ), $message ) );
-        WP_CLI::log( sprintf( __( 'Type: %s', 'cli-dashboard-notice' ), $type ) );
-        
-        if ( $expires ) {
-            $expire_timestamp = CLI_Dashboard_Notice::validate_and_parse_date_public( $expires );
-            if ( $expire_timestamp !== false ) {
-                $time_remaining = $expire_timestamp - time();
-                if ( $time_remaining > 0 ) {
-                    $human_time = CLI_Dashboard_Notice::get_human_time_diff( time(), $expire_timestamp );
-                    WP_CLI::log( sprintf( __( 'Expires: %1$s (%2$s remaining)', 'cli-dashboard-notice' ), $expires, $human_time ) );
+        if ( $notice_id !== null ) {
+            // Show specific notice
+            $option_key = $notice_id === 0 ? CLI_Dashboard_Notice::OPTION_PREFIX : CLI_Dashboard_Notice::OPTION_PREFIX . '_' . $notice_id;
+            $message = get_option( $option_key );
+            
+            if ( $message === false ) {
+                WP_CLI::error( sprintf( __( 'Notice with ID %d not found.', 'cli-dashboard-notice' ), $notice_id ) );
+            }
+            
+            $type_key = $notice_id === 0 ? CLI_Dashboard_Notice::OPTION_PREFIX . '_type' : CLI_Dashboard_Notice::OPTION_PREFIX . '_' . $notice_id . '_type';
+            $expires_key = $notice_id === 0 ? CLI_Dashboard_Notice::OPTION_PREFIX . '_expires' : CLI_Dashboard_Notice::OPTION_PREFIX . '_' . $notice_id . '_expires';
+            
+            $type = get_option( $type_key, 'warning' );
+            $expires = get_option( $expires_key );
+            
+            WP_CLI::log( sprintf( __( 'Notice ID %s Status:', 'cli-dashboard-notice' ), $notice_id === 0 ? 'legacy' : $notice_id ) );
+            WP_CLI::log( sprintf( __( 'Message: %s', 'cli-dashboard-notice' ), $message ) );
+            WP_CLI::log( sprintf( __( 'Type: %s', 'cli-dashboard-notice' ), $type ) );
+            
+            if ( $expires ) {
+                $expire_timestamp = CLI_Dashboard_Notice::validate_and_parse_date_public( $expires );
+                if ( $expire_timestamp !== false ) {
+                    $time_remaining = $expire_timestamp - time();
+                    if ( $time_remaining > 0 ) {
+                        $human_time = CLI_Dashboard_Notice::get_human_time_diff( time(), $expire_timestamp );
+                        WP_CLI::log( sprintf( __( 'Expires: %1$s (%2$s remaining)', 'cli-dashboard-notice' ), $expires, $human_time ) );
+                    } else {
+                        $human_time = CLI_Dashboard_Notice::get_human_time_diff( $expire_timestamp, time() );
+                        WP_CLI::warning( sprintf( __( 'Expired: %1$s (%2$s ago)', 'cli-dashboard-notice' ), $expires, $human_time ) );
+                    }
                 } else {
-                    $human_time = CLI_Dashboard_Notice::get_human_time_diff( $expire_timestamp, time() );
-                    WP_CLI::warning( sprintf( __( 'Expired: %1$s (%2$s ago)', 'cli-dashboard-notice' ), $expires, $human_time ) );
+                    WP_CLI::warning( sprintf( __( 'Invalid expiration date: %s', 'cli-dashboard-notice' ), $expires ) );
                 }
             } else {
-                WP_CLI::warning( sprintf( __( 'Invalid expiration date: %s', 'cli-dashboard-notice' ), $expires ) );
+                WP_CLI::log( __( 'Expires: Never', 'cli-dashboard-notice' ) );
             }
+            
         } else {
-            WP_CLI::log( __( 'Expires: Never', 'cli-dashboard-notice' ) );
+            // Show all notices
+            $all_notices = CLI_Dashboard_Notice::get_all_notices();
+            
+            if ( empty( $all_notices ) ) {
+                WP_CLI::success( __( 'No active notices.', 'cli-dashboard-notice' ) );
+                return;
+            }
+            
+            WP_CLI::log( sprintf( __( 'Active Notices (%d total):', 'cli-dashboard-notice' ), count( $all_notices ) ) );
+            WP_CLI::log( '' );
+            
+            foreach ( $all_notices as $id => $notice ) {
+                WP_CLI::log( sprintf( __( 'ID %s: [%s] %s', 'cli-dashboard-notice' ), 
+                    $id === 0 ? 'legacy' : $id, 
+                    $notice['type'], 
+                    $notice['message'] 
+                ) );
+                
+                if ( $notice['expires'] ) {
+                    $expire_timestamp = CLI_Dashboard_Notice::validate_and_parse_date_public( $notice['expires'] );
+                    if ( $expire_timestamp !== false ) {
+                        $time_remaining = $expire_timestamp - time();
+                        if ( $time_remaining > 0 ) {
+                            $human_time = CLI_Dashboard_Notice::get_human_time_diff( time(), $expire_timestamp );
+                            WP_CLI::log( sprintf( __( '  Expires: %1$s (%2$s remaining)', 'cli-dashboard-notice' ), $notice['expires'], $human_time ) );
+                        } else {
+                            $human_time = CLI_Dashboard_Notice::get_human_time_diff( $expire_timestamp, time() );
+                            WP_CLI::warning( sprintf( __( '  Expired: %1$s (%2$s ago)', 'cli-dashboard-notice' ), $notice['expires'], $human_time ) );
+                        }
+                    } else {
+                        WP_CLI::warning( sprintf( __( '  Invalid expiration date: %s', 'cli-dashboard-notice' ), $notice['expires'] ) );
+                    }
+                } else {
+                    WP_CLI::log( __( '  Expires: Never', 'cli-dashboard-notice' ) );
+                }
+                
+                WP_CLI::log( '' );
+            }
         }
         
         // CLI audit logging for status checks
         CLI_Dashboard_Notice::cli_audit_log( 'Status checked', [
-            'has_message' => ! empty( $message ),
-            'type' => $type,
-            'has_expiry' => ! empty( $expires ),
+            'specific_id' => $notice_id,
+            'total_notices' => $notice_id === null ? count( CLI_Dashboard_Notice::get_all_notices() ) : 1,
             'user_id' => get_current_user_id()
         ] );
     }
