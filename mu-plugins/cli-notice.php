@@ -1,12 +1,12 @@
 <?php
 /**
- * Plugin Name: CLI Dashboard Notice (Secure)
+ * Plugin Name: CLI Dashboard Notice
  * Plugin URI: https://github.com/centminmod/centminmod-mu-plugins
  * Description: Show a notice stored in WP-CLI options with enhanced security:
  *   - temp_cli_dashboard_notice
  *   - temp_cli_dashboard_notice_type
  *   - temp_cli_dashboard_notice_expires
- * Version: 2.0.0
+ * Version: 2.1.1
  * Author: CLI
  * Author URI: https://centminmod.com
  * License: GPLv2 or later
@@ -26,6 +26,13 @@ class CLI_Dashboard_Notice {
     const OPTION_PREFIX = 'temp_cli_dashboard_notice';
     const MAX_MESSAGE_LENGTH = 1000;
     const VALID_TYPES = [ 'info', 'success', 'warning', 'error' ];
+    const DATE_BUFFER_SECONDS = 60;
+    const MIN_TIME_DISPLAY_THRESHOLD = 300;
+    
+    /**
+     * Cached options to prevent multiple database calls
+     */
+    private static $cached_options = null;
     
     /**
      * Initialize the plugin
@@ -44,16 +51,49 @@ class CLI_Dashboard_Notice {
     }
     
     /**
-     * Force cleanup all notice options (for MU-plugin removal).
+     * Force cleanup all notice options (for MU-plugin removal) - Private method for security
      */
-    public function cleanup() {
+    private function cleanup_internal() {
         $permission_check = $this->check_permissions();
         if ( is_wp_error( $permission_check ) ) {
-            WP_CLI::error( $permission_check->get_error_message() );
+            return $permission_check;
         }
         
-        CLI_Dashboard_Notice::cleanup_options();
+        self::cleanup_options();
+        return true;
+    }
+    
+    /**
+     * Public wrapper for cleanup with enhanced security
+     */
+    public function cleanup() {
+        $result = $this->cleanup_internal();
+        if ( is_wp_error( $result ) ) {
+            WP_CLI::error( $result->get_error_message() );
+        }
+        
         WP_CLI::success( __( 'All CLI notice options have been removed from the database.', 'cli-dashboard-notice' ) );
+    }
+    
+    /**
+     * Get cached options to improve performance
+     */
+    private static function get_cached_options() {
+        if ( self::$cached_options === null ) {
+            self::$cached_options = [
+                'message' => get_option( self::OPTION_PREFIX ),
+                'type' => get_option( self::OPTION_PREFIX . '_type', 'warning' ),
+                'expires' => get_option( self::OPTION_PREFIX . '_expires' )
+            ];
+        }
+        return self::$cached_options;
+    }
+    
+    /**
+     * Clear option cache
+     */
+    private static function clear_option_cache() {
+        self::$cached_options = null;
     }
     
     /**
@@ -64,8 +104,8 @@ class CLI_Dashboard_Notice {
             return;
         }
         
-        // Only enqueue if we have an active notice
-        if ( get_option( self::OPTION_PREFIX ) === false ) {
+        $options = self::get_cached_options();
+        if ( $options['message'] === false ) {
             return;
         }
         
@@ -74,6 +114,8 @@ class CLI_Dashboard_Notice {
         jQuery(document).ready(function($) {
             $('.cli-dashboard-notice').on('click', '.notice-dismiss', function(e) {
                 var nonce = $(this).closest('.cli-dashboard-notice').data('nonce');
+                if (!nonce) return;
+                
                 $.post(ajaxurl, {
                     action: 'cli_notice_dismiss',
                     nonce: nonce
@@ -85,17 +127,20 @@ class CLI_Dashboard_Notice {
     }
     
     /**
-     * AJAX handler for notice dismissal
+     * AJAX handler for notice dismissal with enhanced security
      */
     public static function ajax_dismiss_notice() {
-        // Verify nonce
-        if ( ! wp_verify_nonce( $_POST['nonce'] ?? '', 'cli_notice_dismiss' ) ) {
-            wp_die( __( 'Security check failed.', 'cli-dashboard-notice' ) );
+        // Enhanced nonce verification
+        $nonce = sanitize_text_field( $_POST['nonce'] ?? '' );
+        if ( empty( $nonce ) || ! wp_verify_nonce( $nonce, 'cli_notice_dismiss' ) ) {
+            wp_send_json_error( __( 'Security check failed.', 'cli-dashboard-notice' ) );
+            return;
         }
         
         // Check permissions
         if ( ! current_user_can( 'manage_options' ) ) {
-            wp_die( __( 'Insufficient permissions.', 'cli-dashboard-notice' ) );
+            wp_send_json_error( __( 'Insufficient permissions.', 'cli-dashboard-notice' ) );
+            return;
         }
         
         // Clean up notice
@@ -113,10 +158,11 @@ class CLI_Dashboard_Notice {
             return;
         }
         
+        $options = self::get_cached_options();
+        
         // Auto-expire logic with proper validation
-        $expires = get_option( self::OPTION_PREFIX . '_expires' );
-        if ( $expires ) {
-            $expire_timestamp = self::validate_and_parse_date( $expires );
+        if ( $options['expires'] ) {
+            $expire_timestamp = self::validate_and_parse_date( $options['expires'] );
             if ( $expire_timestamp === false || time() > $expire_timestamp ) {
                 self::cleanup_options();
                 return;
@@ -124,16 +170,15 @@ class CLI_Dashboard_Notice {
         }
         
         // Get and validate message
-        $message = get_option( self::OPTION_PREFIX );
+        $message = $options['message'];
         if ( empty( $message ) ) {
             return;
         }
         
         // Get and validate notice type
-        $type = get_option( self::OPTION_PREFIX . '_type', 'warning' );
-        $type = self::validate_notice_type( $type );
+        $type = self::validate_notice_type( $options['type'] );
         
-        // Generate nonce for AJAX dismissal (future enhancement)
+        // Generate nonce for AJAX dismissal
         $nonce = wp_create_nonce( 'cli_notice_dismiss' );
         
         // Output notice with proper escaping and nonce
@@ -146,7 +191,7 @@ class CLI_Dashboard_Notice {
     }
     
     /**
-     * Validate and parse expiration date
+     * Validate and parse expiration date with race condition protection
      *
      * @param string $date_string Date string to validate
      * @return int|false Timestamp or false on failure
@@ -163,8 +208,8 @@ class CLI_Dashboard_Notice {
         
         $timestamp = strtotime( $date_string );
         
-        // Check if strtotime succeeded and reject any past dates
-        if ( $timestamp === false || $timestamp <= time() ) {
+        // Check if strtotime succeeded - add buffer to prevent race conditions
+        if ( $timestamp === false || $timestamp <= ( time() + self::DATE_BUFFER_SECONDS ) ) {
             return false;
         }
         
@@ -195,7 +240,7 @@ class CLI_Dashboard_Notice {
             'a'      => [
                 'href'   => [],
                 'title'  => [],
-                'rel'    => []  // Removed target to prevent phishing
+                'rel'    => []
             ]
         ];
     }
@@ -214,14 +259,17 @@ class CLI_Dashboard_Notice {
             delete_option( $option );
         }
         
-        // Log cleanup for debugging
-        if ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
+        // Clear cache after cleanup
+        self::clear_option_cache();
+        
+        // Optional logging - disabled by default, enable via filter
+        if ( apply_filters( 'cli_dashboard_notice_enable_logging', false ) && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
             error_log( __( 'CLI Dashboard Notice: Options cleaned up', 'cli-dashboard-notice' ) );
         }
     }
     
     /**
-     * Validate message content
+     * Validate message content with WordPress built-in functions
      *
      * @param string $message Message to validate
      * @return string|WP_Error Sanitized message or error
@@ -238,29 +286,14 @@ class CLI_Dashboard_Notice {
             );
         }
         
-        // Sanitize the message and ensure safe links
+        // Use WordPress built-in link processing instead of regex
         $sanitized = wp_kses( trim( $message ), self::get_allowed_html() );
         
-        // Post-process to add security attributes to links
-        $sanitized = preg_replace_callback(
-            '/<a\s+([^>]*?)href\s*=\s*["\']([^"\']*)["\']([^>]*?)>/i',
-            function( $matches ) {
-                $before = $matches[1];
-                $href = $matches[2];
-                $after = $matches[3];
-                
-                // Add noopener noreferrer for external links
-                if ( strpos( $href, home_url() ) !== 0 && filter_var( $href, FILTER_VALIDATE_URL ) ) {
-                    $rel_attr = 'rel="noopener noreferrer"';
-                    if ( strpos( $after, 'rel=' ) === false && strpos( $before, 'rel=' ) === false ) {
-                        $after = ' ' . $rel_attr . $after;
-                    }
-                }
-                
-                return '<a ' . $before . 'href="' . esc_url( $href ) . '"' . $after . '>';
-            },
-            $sanitized
-        );
+        // Use WordPress built-in make_clickable for safe link processing
+        $sanitized = make_clickable( $sanitized );
+        
+        // Add security attributes to external links using WordPress functions
+        $sanitized = wp_rel_nofollow( $sanitized );
         
         return $sanitized;
     }
@@ -274,56 +307,312 @@ class CLI_Dashboard_Notice {
     public static function validate_and_parse_date_public( $date_string ) {
         return self::validate_and_parse_date( $date_string );
     }
+    
+    /**
+     * Get human time difference with minimum threshold
+     *
+     * @param int $from_timestamp From timestamp
+     * @param int $to_timestamp To timestamp
+     * @return string Human readable time difference
+     */
+    public static function get_human_time_diff( $from_timestamp, $to_timestamp ) {
+        $diff = abs( $to_timestamp - $from_timestamp );
+        
+        // Don't show confusing short time periods
+        if ( $diff < self::MIN_TIME_DISPLAY_THRESHOLD ) {
+            return __( 'a few minutes', 'cli-dashboard-notice' );
+        }
+        
+        return human_time_diff( $from_timestamp, $to_timestamp );
+    }
+    
+    /**
+     * CLI audit logging with enhanced context
+     *
+     * @param string $message Log message
+     * @param array $context Additional context
+     */
+    public static function cli_audit_log( $message, $context = [] ) {
+        // CLI operations are always logged when in CLI context
+        if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
+            return;
+        }
+        
+        // Prepare enhanced audit context
+        $audit_data = [
+            'timestamp' => current_time( 'mysql' ),
+            'operation' => $message,
+            'wp_user_id' => get_current_user_id() ?: 'cli-no-user',
+            'system_user' => function_exists( 'posix_getpwuid' ) && function_exists( 'posix_geteuid' ) ? 
+                ( posix_getpwuid( posix_geteuid() )['name'] ?? 'unknown' ) : 'unknown',
+            'server_ip' => $_SERVER['SERVER_ADDR'] ?? 'unknown',
+            'wp_cli_version' => defined( 'WP_CLI_VERSION' ) ? WP_CLI_VERSION : 'unknown',
+            'php_version' => PHP_VERSION,
+            'wp_version' => get_bloginfo( 'version' )
+        ];
+        
+        // Add operation-specific context
+        if ( ! empty( $context ) ) {
+            $audit_data = array_merge( $audit_data, $context );
+        }
+        
+        // Create log entry
+        $log_entry = sprintf(
+            'CLI Dashboard Notice: %s | Context: %s',
+            $message,
+            wp_json_encode( $audit_data )
+        );
+        
+        // Log to multiple destinations
+        if ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
+            error_log( $log_entry );
+        }
+        
+        // Log to custom file if specified
+        $custom_log_file = defined( 'CLI_NOTICE_LOG_FILE' ) ? CLI_NOTICE_LOG_FILE : null;
+        if ( $custom_log_file && is_writable( dirname( $custom_log_file ) ) ) {
+            file_put_contents( $custom_log_file, date( 'Y-m-d H:i:s' ) . ' ' . $log_entry . PHP_EOL, FILE_APPEND | LOCK_EX );
+        }
+        
+        // Allow custom logging via action hook
+        do_action( 'cli_dashboard_notice_audit_log', $message, $audit_data );
+    }
 }
 
 // Initialize the plugin
 CLI_Dashboard_Notice::init();
 
 /**
- * Manage temporary admin notices with enhanced security.
+ * Manage temporary admin notices with enhanced security and controlled CLI bypass.
  *
  * ## EXAMPLES
  *
- *     # Basic usage (works with file system access)
- *     wp notice add "🔔 Hello world" --type=info --expires="2025-06-20 03:00:00"
- *     wp notice update "✅ Done"
- *     wp notice delete
- *     wp notice status
- *     wp notice cleanup
+ *     # CLI operations with bypass flag
+ *     wp notice add "🔔 Hello world" --type=info --allow-cli
+ *     wp notice update "✅ Done" --allow-cli
+ *     wp notice delete --allow-cli
+ *     wp notice status                    # Read operations don't need --allow-cli
+ *     wp notice cleanup --allow-cli
  *
- *     # With specific user context (recommended for shared servers)
- *     wp notice add "🔔 Hello world" --user=admin
+ *     # With environment variable (for bulk operations)
+ *     CLI_NOTICE_ENABLE=1 wp notice add "🔔 Hello world" --type=info
+ *
+ *     # Web operations unchanged (secure)
+ *     # AJAX dismissal still requires proper nonce and user permissions
  *
  * ## SECURITY
  *
- *     Commands work with file system access but are logged for security auditing.
- *     Use --user=<username> for explicit WordPress user context on shared servers.
+ *     Web operations: STRICT - Always require manage_options capability
+ *     CLI read operations: ALLOWED - Status checks work without flags  
+ *     CLI write operations: CONTROLLED - Require --allow-cli flag or CLI_NOTICE_ENABLE=1
+ *     All CLI operations: LOGGED - Comprehensive audit trail
  */
 class CLI_Notice_Command {
     
     /**
-     * Check user permissions before executing commands (practical security)
+     * Check if CLI bypass is enabled and log the attempt
      *
-     * @return bool|WP_Error True if authorized, WP_Error otherwise
+     * @param string $operation Operation being attempted
+     * @param array $assoc_args WP-CLI associated arguments
+     * @return bool|WP_Error True if bypass allowed, WP_Error otherwise
      */
-    private function check_permissions() {
-        // Ensure WordPress functions are available
-        if ( ! function_exists( 'wp_get_current_user' ) ) {
-            return new WP_Error( 'no_user_context', __( 'No WordPress user context available.', 'cli-dashboard-notice' ) );
+    private function check_cli_bypass( $operation, $assoc_args = [] ) {
+        // Always log CLI operation attempts
+        CLI_Dashboard_Notice::cli_audit_log( "CLI operation attempted: {$operation}", [
+            'bypass_method' => 'checking',
+            'args' => array_keys( $assoc_args )
+        ] );
+        
+        // Check if --allow-cli flag is present
+        $allow_cli_flag = isset( $assoc_args['allow-cli'] );
+        
+        // Check if environment variable is set
+        $env_enabled = getenv( 'CLI_NOTICE_ENABLE' ) === '1' || 
+                      ( defined( 'CLI_NOTICE_ENABLE' ) && CLI_NOTICE_ENABLE );
+        
+        // Check if IP restrictions apply
+        if ( $env_enabled || $allow_cli_flag ) {
+            $ip_check = $this->check_ip_restrictions();
+            if ( is_wp_error( $ip_check ) ) {
+                CLI_Dashboard_Notice::cli_audit_log( "CLI operation blocked: IP restriction", [
+                    'operation' => $operation,
+                    'client_ip' => $_SERVER['REMOTE_ADDR'] ?? 'unknown'
+                ] );
+                return $ip_check;
+            }
         }
         
-        $current_user = wp_get_current_user();
+        // Check if time restrictions apply
+        if ( $env_enabled || $allow_cli_flag ) {
+            $time_check = $this->check_time_restrictions();
+            if ( is_wp_error( $time_check ) ) {
+                CLI_Dashboard_Notice::cli_audit_log( "CLI operation blocked: Time restriction", [
+                    'operation' => $operation,
+                    'current_time' => current_time( 'mysql' )
+                ] );
+                return $time_check;
+            }
+        }
         
-        // If user context exists, check capabilities
-        if ( $current_user->exists() ) {
-            if ( ! current_user_can( 'manage_options' ) ) {
-                return new WP_Error( 'insufficient_permissions', __( 'You do not have permission to manage notices.', 'cli-dashboard-notice' ) );
+        if ( $allow_cli_flag || $env_enabled ) {
+            CLI_Dashboard_Notice::cli_audit_log( "CLI bypass granted for: {$operation}", [
+                'bypass_method' => $allow_cli_flag ? 'flag' : 'environment',
+                'flag_present' => $allow_cli_flag,
+                'env_enabled' => $env_enabled
+            ] );
+            return true;
+        }
+        
+        return new WP_Error( 'cli_bypass_required', 
+            sprintf( 
+                __( 'CLI write operation "%s" requires --allow-cli flag or CLI_NOTICE_ENABLE=1 environment variable.', 'cli-dashboard-notice' ),
+                $operation
+            )
+        );
+    }
+    
+    /**
+     * Check IP restrictions for CLI operations
+     *
+     * @return bool|WP_Error True if allowed, WP_Error if blocked
+     */
+    private function check_ip_restrictions() {
+        // Skip IP check if no restrictions defined
+        $allowed_ips_env = getenv( 'CLI_NOTICE_ALLOWED_IPS' );
+        $allowed_ips_const = defined( 'CLI_NOTICE_ALLOWED_IPS' ) ? CLI_NOTICE_ALLOWED_IPS : null;
+        
+        if ( empty( $allowed_ips_env ) && empty( $allowed_ips_const ) ) {
+            return true; // No restrictions
+        }
+        
+        $allowed_ips = $allowed_ips_env ?: $allowed_ips_const;
+        $allowed_ips_array = array_map( 'trim', explode( ',', $allowed_ips ) );
+        
+        $client_ip = $_SERVER['REMOTE_ADDR'] ?? 'unknown';
+        
+        // Allow localhost/CLI context
+        $localhost_ips = [ '127.0.0.1', '::1', 'localhost', 'unknown' ];
+        if ( in_array( $client_ip, $localhost_ips, true ) ) {
+            return true;
+        }
+        
+        if ( in_array( $client_ip, $allowed_ips_array, true ) ) {
+            return true;
+        }
+        
+        return new WP_Error( 'ip_blocked', 
+            sprintf( __( 'CLI operations not allowed from IP: %s', 'cli-dashboard-notice' ), $client_ip )
+        );
+    }
+    
+    /**
+     * Check time restrictions for CLI operations
+     *
+     * @return bool|WP_Error True if allowed, WP_Error if blocked
+     */
+    private function check_time_restrictions() {
+        $business_hours_only = getenv( 'CLI_NOTICE_BUSINESS_HOURS_ONLY' ) === '1' || 
+                              ( defined( 'CLI_NOTICE_BUSINESS_HOURS_ONLY' ) && CLI_NOTICE_BUSINESS_HOURS_ONLY );
+        
+        if ( ! $business_hours_only ) {
+            return true; // No time restrictions
+        }
+        
+        $current_hour = (int) current_time( 'H' );
+        $start_hour = defined( 'CLI_NOTICE_BUSINESS_START' ) ? CLI_NOTICE_BUSINESS_START : 9;
+        $end_hour = defined( 'CLI_NOTICE_BUSINESS_END' ) ? CLI_NOTICE_BUSINESS_END : 17;
+        
+        if ( $current_hour >= $start_hour && $current_hour <= $end_hour ) {
+            return true;
+        }
+        
+        return new WP_Error( 'outside_business_hours', 
+            sprintf( 
+                __( 'CLI operations only allowed during business hours (%d:00 - %d:00).', 'cli-dashboard-notice' ),
+                $start_hour, $end_hour
+            )
+        );
+    }
+    
+    /**
+     * Check user permissions with enhanced CLI handling
+     *
+     * @param string $operation Operation being performed
+     * @param array $assoc_args WP-CLI associated arguments
+     * @return true|WP_Error True if authorized, WP_Error otherwise
+     */
+    private function check_permissions( $operation = '', $assoc_args = [] ) {
+        // Ensure WordPress functions are available
+        if ( ! function_exists( 'wp_get_current_user' ) ) {
+            return new WP_Error( 'no_wp_functions', __( 'WordPress functions not available.', 'cli-dashboard-notice' ) );
+        }
+        
+        // Handle CLI context with controlled bypass
+        if ( defined( 'WP_CLI' ) && WP_CLI ) {
+            $current_user = wp_get_current_user();
+            
+            // For read operations in CLI, allow without user context
+            if ( in_array( $operation, [ 'status', 'list' ], true ) ) {
+                CLI_Dashboard_Notice::cli_audit_log( "CLI read operation allowed: {$operation}" );
+                return true;
             }
-        } else {
-            // In CLI context without user, allow but log for security auditing
-            if ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
-                error_log( __( 'CLI Notice: Command executed via file system access (no WordPress user context)', 'cli-dashboard-notice' ) );
+            
+            // For write operations, check if user context exists first
+            if ( $current_user->exists() && current_user_can( 'manage_options' ) ) {
+                CLI_Dashboard_Notice::cli_audit_log( "CLI operation with user context: {$operation}", [
+                    'user_id' => $current_user->ID,
+                    'user_login' => $current_user->user_login
+                ] );
+                return true;
             }
+            
+            // No user context - check for CLI bypass
+            return $this->check_cli_bypass( $operation, $assoc_args );
+        }
+        
+        // Web context - always strict
+        $current_user = wp_get_current_user();
+        if ( ! $current_user->exists() || ! current_user_can( 'manage_options' ) ) {
+            return new WP_Error( 'insufficient_permissions', 
+                __( 'You do not have permission to manage notices. Ensure you are logged in as an administrator.', 'cli-dashboard-notice' ) 
+            );
+        }
+        
+        return true;
+    }
+    
+    /**
+     * Handle WP_Error consistently across all methods
+     *
+     * @param WP_Error|mixed $result Result to check
+     * @param string $success_message Optional success message
+     */
+    private function handle_result( $result, $success_message = '' ) {
+        if ( is_wp_error( $result ) ) {
+            WP_CLI::error( $result->get_error_message() );
+            return;
+        }
+        
+        if ( ! empty( $success_message ) ) {
+            WP_CLI::success( $success_message );
+        }
+    }
+    
+    /**
+     * Atomic check and update for notice existence to prevent race conditions
+     *
+     * @param string $operation 'add' or 'update'
+     * @return true|WP_Error
+     */
+    private function atomic_notice_check( $operation ) {
+        $existing_notice = get_option( CLI_Dashboard_Notice::OPTION_PREFIX );
+        
+        if ( $operation === 'add' && $existing_notice !== false ) {
+            return new WP_Error( 'notice_exists', __( 'A notice already exists. Use "wp notice update" to modify it or "wp notice delete" to remove it first.', 'cli-dashboard-notice' ) );
+        }
+        
+        if ( $operation === 'update' && $existing_notice === false ) {
+            return new WP_Error( 'no_notice_exists', __( 'No notice exists to update. Use "wp notice add" to create one.', 'cli-dashboard-notice' ) );
         }
         
         return true;
@@ -332,21 +621,20 @@ class CLI_Notice_Command {
     /**
      * Add a new dashboard notice.
      *
-     * @synopsis <message> [--type=<type>] [--expires=<expires>]
+     * @synopsis <message> [--type=<type>] [--expires=<expires>] [--allow-cli]
      */
     public function add( $args, $assoc ) {
-        $permission_check = $this->check_permissions();
-        if ( is_wp_error( $permission_check ) ) {
-            WP_CLI::error( $permission_check->get_error_message() );
-        }
+        $permission_check = $this->check_permissions( 'add', $assoc );
+        $this->handle_result( $permission_check );
+        
+        // Atomic check for existing notice
+        $existence_check = $this->atomic_notice_check( 'add' );
+        $this->handle_result( $existence_check );
         
         // Validate and sanitize input
         $message = implode( ' ', $args );
         $validated_message = CLI_Dashboard_Notice::validate_message( $message );
-        
-        if ( is_wp_error( $validated_message ) ) {
-            WP_CLI::error( $validated_message->get_error_message() );
-        }
+        $this->handle_result( $validated_message );
         
         $type = $assoc['type'] ?? 'warning';
         if ( ! in_array( $type, CLI_Dashboard_Notice::VALID_TYPES, true ) ) {
@@ -360,18 +648,8 @@ class CLI_Notice_Command {
         if ( $expires ) {
             $expire_timestamp = CLI_Dashboard_Notice::validate_and_parse_date_public( $expires );
             if ( $expire_timestamp === false ) {
-                WP_CLI::error( __( 'Invalid expiration date format. Use: YYYY-MM-DD HH:MM:SS', 'cli-dashboard-notice' ) );
+                WP_CLI::error( __( 'Invalid expiration date format. Use: YYYY-MM-DD HH:MM:SS (must be in the future)', 'cli-dashboard-notice' ) );
             }
-            
-            // Check if expiration is in the past
-            if ( $expire_timestamp <= time() ) {
-                WP_CLI::error( __( 'Expiration date cannot be in the past.', 'cli-dashboard-notice' ) );
-            }
-        }
-        
-        // Check if notice already exists
-        if ( get_option( CLI_Dashboard_Notice::OPTION_PREFIX ) !== false ) {
-            WP_CLI::error( __( 'A notice already exists. Use "wp notice update" to modify it or "wp notice delete" to remove it first.', 'cli-dashboard-notice' ) );
         }
         
         // Store the notice using WordPress functions directly
@@ -388,39 +666,32 @@ class CLI_Notice_Command {
         
         WP_CLI::success( sprintf( __( 'Notice added successfully. Type: %s', 'cli-dashboard-notice' ), $type ) );
         
-        // Log the action for security auditing
-        if ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
-            error_log( sprintf( 
-                'CLI Notice: Added notice - Type: %s, Expires: %s', 
-                $type, 
-                $expires ?: 'never' 
-            ) );
-        }
+        // CLI audit logging
+        CLI_Dashboard_Notice::cli_audit_log( 'Notice added', [
+            'type' => $type,
+            'expires' => $expires ?: 'never',
+            'message_length' => strlen( $message ),
+            'user_id' => get_current_user_id()
+        ] );
     }
     
     /**
      * Update an existing dashboard notice.
      *
-     * @synopsis <message> [--type=<type>] [--expires=<expires>] [--clear-expiry]
+     * @synopsis <message> [--type=<type>] [--expires=<expires>] [--clear-expiry] [--allow-cli]
      */
     public function update( $args, $assoc ) {
-        $permission_check = $this->check_permissions();
-        if ( is_wp_error( $permission_check ) ) {
-            WP_CLI::error( $permission_check->get_error_message() );
-        }
+        $permission_check = $this->check_permissions( 'update', $assoc );
+        $this->handle_result( $permission_check );
         
-        // Check if notice exists
-        if ( get_option( CLI_Dashboard_Notice::OPTION_PREFIX ) === false ) {
-            WP_CLI::error( __( 'No notice exists to update. Use "wp notice add" to create one.', 'cli-dashboard-notice' ) );
-        }
+        // Atomic check for existing notice
+        $existence_check = $this->atomic_notice_check( 'update' );
+        $this->handle_result( $existence_check );
         
         // Validate and sanitize input
         $message = implode( ' ', $args );
         $validated_message = CLI_Dashboard_Notice::validate_message( $message );
-        
-        if ( is_wp_error( $validated_message ) ) {
-            WP_CLI::error( $validated_message->get_error_message() );
-        }
+        $this->handle_result( $validated_message );
         
         $type = $assoc['type'] ?? get_option( CLI_Dashboard_Notice::OPTION_PREFIX . '_type', 'warning' );
         if ( ! in_array( $type, CLI_Dashboard_Notice::VALID_TYPES, true ) ) {
@@ -437,11 +708,7 @@ class CLI_Notice_Command {
         if ( $expires ) {
             $expire_timestamp = CLI_Dashboard_Notice::validate_and_parse_date_public( $expires );
             if ( $expire_timestamp === false ) {
-                WP_CLI::error( __( 'Invalid expiration date format. Use: YYYY-MM-DD HH:MM:SS', 'cli-dashboard-notice' ) );
-            }
-            
-            if ( $expire_timestamp <= time() ) {
-                WP_CLI::error( __( 'Expiration date cannot be in the past.', 'cli-dashboard-notice' ) );
+                WP_CLI::error( __( 'Invalid expiration date format. Use: YYYY-MM-DD HH:MM:SS (must be in the future)', 'cli-dashboard-notice' ) );
             }
         }
         
@@ -457,24 +724,23 @@ class CLI_Notice_Command {
         
         WP_CLI::success( sprintf( __( 'Notice updated successfully. Type: %s', 'cli-dashboard-notice' ), $type ) );
         
-        // Log the action
-        if ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
-            error_log( sprintf( 
-                'CLI Notice: Updated notice - Type: %s, Expires: %s', 
-                $type, 
-                $expires ?: ( $clear_expiry ? 'cleared' : 'unchanged' )
-            ) );
-        }
+        // CLI audit logging
+        CLI_Dashboard_Notice::cli_audit_log( 'Notice updated', [
+            'type' => $type,
+            'expires' => $expires ?: ( $clear_expiry ? 'cleared' : 'unchanged' ),
+            'message_length' => strlen( $message ),
+            'user_id' => get_current_user_id()
+        ] );
     }
     
     /**
      * Delete the dashboard notice.
+     *
+     * @synopsis [--allow-cli]
      */
-    public function delete() {
-        $permission_check = $this->check_permissions();
-        if ( is_wp_error( $permission_check ) ) {
-            WP_CLI::error( $permission_check->get_error_message() );
-        }
+    public function delete( $args, $assoc ) {
+        $permission_check = $this->check_permissions( 'delete', $assoc );
+        $this->handle_result( $permission_check );
         
         $options = [
             CLI_Dashboard_Notice::OPTION_PREFIX,
@@ -499,21 +765,23 @@ class CLI_Notice_Command {
         } else {
             WP_CLI::success( __( 'Notice removal complete.', 'cli-dashboard-notice' ) );
             
-            // Log the action
-            if ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
-                error_log( sprintf( __( 'CLI Notice: Deleted notice - %d options removed', 'cli-dashboard-notice' ), $deleted_count ) );
-            }
+            // CLI audit logging
+            CLI_Dashboard_Notice::cli_audit_log( 'Notice deleted', [
+                'options_removed' => $deleted_count,
+                'user_id' => get_current_user_id()
+            ] );
         }
     }
     
     /**
      * Show current notice status and details.
+     *
+     * @synopsis [--allow-cli]
      */
-    public function status() {
-        $permission_check = $this->check_permissions();
-        if ( is_wp_error( $permission_check ) ) {
-            WP_CLI::error( $permission_check->get_error_message() );
-        }
+    public function status( $args, $assoc ) {
+        // Status is a read operation - always allowed in CLI
+        $permission_check = $this->check_permissions( 'status', $assoc );
+        $this->handle_result( $permission_check );
         
         $message = get_option( CLI_Dashboard_Notice::OPTION_PREFIX );
         
@@ -534,9 +802,11 @@ class CLI_Notice_Command {
             if ( $expire_timestamp !== false ) {
                 $time_remaining = $expire_timestamp - time();
                 if ( $time_remaining > 0 ) {
-                    WP_CLI::log( sprintf( __( 'Expires: %1$s (%2$s remaining)', 'cli-dashboard-notice' ), $expires, human_time_diff( time(), $expire_timestamp ) ) );
+                    $human_time = CLI_Dashboard_Notice::get_human_time_diff( time(), $expire_timestamp );
+                    WP_CLI::log( sprintf( __( 'Expires: %1$s (%2$s remaining)', 'cli-dashboard-notice' ), $expires, $human_time ) );
                 } else {
-                    WP_CLI::warning( sprintf( __( 'Expired: %1$s (%2$s ago)', 'cli-dashboard-notice' ), $expires, human_time_diff( $expire_timestamp, time() ) ) );
+                    $human_time = CLI_Dashboard_Notice::get_human_time_diff( $expire_timestamp, time() );
+                    WP_CLI::warning( sprintf( __( 'Expired: %1$s (%2$s ago)', 'cli-dashboard-notice' ), $expires, $human_time ) );
                 }
             } else {
                 WP_CLI::warning( sprintf( __( 'Invalid expiration date: %s', 'cli-dashboard-notice' ), $expires ) );
@@ -544,6 +814,136 @@ class CLI_Notice_Command {
         } else {
             WP_CLI::log( __( 'Expires: Never', 'cli-dashboard-notice' ) );
         }
+        
+        // CLI audit logging for status checks
+        CLI_Dashboard_Notice::cli_audit_log( 'Status checked', [
+            'has_message' => ! empty( $message ),
+            'type' => $type,
+            'has_expiry' => ! empty( $expires ),
+            'user_id' => get_current_user_id()
+        ] );
+    }
+    
+    /**
+     * Show CLI bypass configuration and security status.
+     */
+    public function security_status() {
+        // This is always a read operation
+        WP_CLI::log( __( 'CLI Dashboard Notice Security Configuration:', 'cli-dashboard-notice' ) );
+        WP_CLI::log( '' );
+        
+        // Check environment variables
+        $env_enabled = getenv( 'CLI_NOTICE_ENABLE' ) === '1';
+        $allowed_ips = getenv( 'CLI_NOTICE_ALLOWED_IPS' );
+        $business_hours = getenv( 'CLI_NOTICE_BUSINESS_HOURS_ONLY' ) === '1';
+        
+        // Check constants
+        $const_enabled = defined( 'CLI_NOTICE_ENABLE' ) && CLI_NOTICE_ENABLE;
+        $const_ips = defined( 'CLI_NOTICE_ALLOWED_IPS' ) ? CLI_NOTICE_ALLOWED_IPS : null;
+        $const_business = defined( 'CLI_NOTICE_BUSINESS_HOURS_ONLY' ) && CLI_NOTICE_BUSINESS_HOURS_ONLY;
+        
+        WP_CLI::log( sprintf( __( 'Environment CLI Enable: %s', 'cli-dashboard-notice' ), $env_enabled ? 'Yes' : 'No' ) );
+        WP_CLI::log( sprintf( __( 'Constant CLI Enable: %s', 'cli-dashboard-notice' ), $const_enabled ? 'Yes' : 'No' ) );
+        WP_CLI::log( sprintf( __( 'IP Restrictions (ENV): %s', 'cli-dashboard-notice' ), $allowed_ips ?: 'None' ) );
+        WP_CLI::log( sprintf( __( 'IP Restrictions (CONST): %s', 'cli-dashboard-notice' ), $const_ips ?: 'None' ) );
+        WP_CLI::log( sprintf( __( 'Business Hours Only (ENV): %s', 'cli-dashboard-notice' ), $business_hours ? 'Yes' : 'No' ) );
+        WP_CLI::log( sprintf( __( 'Business Hours Only (CONST): %s', 'cli-dashboard-notice' ), $const_business ? 'Yes' : 'No' ) );
+        
+        // Current user context
+        $current_user = wp_get_current_user();
+        if ( $current_user->exists() ) {
+            WP_CLI::log( sprintf( __( 'WordPress User: %s (ID: %d)', 'cli-dashboard-notice' ), $current_user->user_login, $current_user->ID ) );
+            WP_CLI::log( sprintf( __( 'Can Manage Options: %s', 'cli-dashboard-notice' ), current_user_can( 'manage_options' ) ? 'Yes' : 'No' ) );
+        } else {
+            WP_CLI::log( __( 'WordPress User: No user context', 'cli-dashboard-notice' ) );
+        }
+        
+        // System user
+        if ( function_exists( 'posix_getpwuid' ) && function_exists( 'posix_geteuid' ) ) {
+            $system_user = posix_getpwuid( posix_geteuid() )['name'] ?? 'unknown';
+            WP_CLI::log( sprintf( __( 'System User: %s', 'cli-dashboard-notice' ), $system_user ) );
+        }
+        
+        // Log file locations
+        WP_CLI::log( '' );
+        WP_CLI::log( __( 'Logging Configuration:', 'cli-dashboard-notice' ) );
+        
+        if ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
+            $log_file = defined( 'WP_CONTENT_DIR' ) ? WP_CONTENT_DIR . '/debug.log' : 'wp-content/debug.log';
+            WP_CLI::log( sprintf( __( 'WordPress Debug Log: %s', 'cli-dashboard-notice' ), $log_file ) );
+        } else {
+            WP_CLI::log( __( 'WordPress Debug Log: Disabled', 'cli-dashboard-notice' ) );
+        }
+        
+        if ( defined( 'CLI_NOTICE_LOG_FILE' ) ) {
+            WP_CLI::log( sprintf( __( 'Custom Log File: %s', 'cli-dashboard-notice' ), CLI_NOTICE_LOG_FILE ) );
+        } else {
+            WP_CLI::log( __( 'Custom Log File: Not configured', 'cli-dashboard-notice' ) );
+        }
+        
+        // Security recommendations
+        WP_CLI::log( '' );
+        WP_CLI::log( __( 'Security Recommendations:', 'cli-dashboard-notice' ) );
+        
+        if ( ! $env_enabled && ! $const_enabled ) {
+            WP_CLI::log( __( '✅ CLI bypass disabled - Maximum security', 'cli-dashboard-notice' ) );
+            WP_CLI::log( __( '   Use --allow-cli flag for write operations', 'cli-dashboard-notice' ) );
+        } else {
+            WP_CLI::warning( __( '⚠️ CLI bypass enabled - Review security settings', 'cli-dashboard-notice' ) );
+            
+            if ( empty( $allowed_ips ) && empty( $const_ips ) ) {
+                WP_CLI::warning( __( '⚠️ No IP restrictions - Consider adding IP whitelist', 'cli-dashboard-notice' ) );
+            }
+            
+            if ( ! $business_hours && ! $const_business ) {
+                WP_CLI::log( __( '💡 Consider enabling business hours restrictions', 'cli-dashboard-notice' ) );
+            }
+        }
+        
+        CLI_Dashboard_Notice::cli_audit_log( 'Security status checked' );
+    }
+    
+    /**
+     * Enable CLI bypass for current session (temporary).
+     *
+     * @synopsis [--ip-whitelist=<ips>] [--business-hours-only] [--confirm]
+     */
+    public function enable_cli( $args, $assoc ) {
+        if ( ! isset( $assoc['confirm'] ) ) {
+            WP_CLI::error( __( 'This command enables CLI bypass. Use --confirm flag to proceed.', 'cli-dashboard-notice' ) );
+        }
+        
+        // Check current user has permission to modify security settings
+        if ( ! current_user_can( 'manage_options' ) ) {
+            WP_CLI::error( __( 'You must have manage_options capability to enable CLI bypass.', 'cli-dashboard-notice' ) );
+        }
+        
+        $env_commands = [ 'export CLI_NOTICE_ENABLE=1' ];
+        
+        if ( isset( $assoc['ip-whitelist'] ) ) {
+            $ips = sanitize_text_field( $assoc['ip-whitelist'] );
+            $env_commands[] = sprintf( 'export CLI_NOTICE_ALLOWED_IPS="%s"', $ips );
+        }
+        
+        if ( isset( $assoc['business-hours-only'] ) ) {
+            $env_commands[] = 'export CLI_NOTICE_BUSINESS_HOURS_ONLY=1';
+        }
+        
+        WP_CLI::log( __( 'To enable CLI bypass for this session, run:', 'cli-dashboard-notice' ) );
+        WP_CLI::log( '' );
+        foreach ( $env_commands as $cmd ) {
+            WP_CLI::log( $cmd );
+        }
+        WP_CLI::log( '' );
+        WP_CLI::log( __( 'Then use wp notice commands normally without --allow-cli flag.', 'cli-dashboard-notice' ) );
+        
+        WP_CLI::warning( __( 'Remember: This only affects the current shell session.', 'cli-dashboard-notice' ) );
+        
+        CLI_Dashboard_Notice::cli_audit_log( 'CLI bypass configuration displayed', [
+            'ip_whitelist' => $assoc['ip-whitelist'] ?? 'none',
+            'business_hours' => isset( $assoc['business-hours-only'] ),
+            'user_id' => get_current_user_id()
+        ] );
     }
 }
 

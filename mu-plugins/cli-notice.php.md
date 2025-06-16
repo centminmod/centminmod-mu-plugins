@@ -1,6 +1,6 @@
-# CLI Dashboard Notice README (v2.0.0)
+# CLI Dashboard Notice README (v2.1.1)
 
-This document provides instructions for installing, configuring, and using the **CLI Dashboard Notice** Must-Use plugin for WordPress. This tool enables you to add, update, and delete temporary admin dashboard notices entirely via WP‑CLI commands, with enhanced security and validation.
+This document provides instructions for installing, configuring, and using the **CLI Dashboard Notice** Must-Use plugin for WordPress. This tool enables you to add, update, and delete temporary admin dashboard notices entirely via WP‑CLI commands, with enhanced security, controlled CLI bypass for bulk operations, and comprehensive audit logging.
 
 ![screenshot](screenshots/wp-plugin-cli-notice.png)
 
@@ -10,17 +10,16 @@ This document provides instructions for installing, configuring, and using the *
 
 * [Prerequisites](#prerequisites)
 * [Installation](#installation)
-* [Security Features](#security-features)
+* [What's New in v2.1.1](#whats-new-in-v211)
+* [Security Model](#security-model)
+* [CLI Bypass Features](#cli-bypass-features)
 * [Usage](#usage)
-  * [`wp notice add`](#wp-notice-add)
-  * [`wp notice update`](#wp-notice-update)
-  * [`wp notice delete`](#wp-notice-delete)
-  * [`wp notice status`](#wp-notice-status)
+* [Bulk Operations](#bulk-operations)
+* [Security Configuration](#security-configuration)
+* [Audit Logging](#audit-logging)
 * [Examples](#examples)
-* [Security Considerations](#security-considerations)
 * [Troubleshooting](#troubleshooting)
 * [Advanced Features](#advanced-features)
-* [Migration from v1.x](#migration-from-v1x)
 
 ---
 
@@ -30,7 +29,7 @@ This document provides instructions for installing, configuring, and using the *
 * WP‑CLI installed and available in your server's `$PATH`.
 * File system access to your WordPress root (SSH or similar).
 * PHP 7.4 or later (recommended: PHP 8.0+).
-* User with `manage_options` capability for WordPress admin context.
+* User with `manage_options` capability for WordPress admin context (optional for CLI).
 * (Optional) SELinux on AlmaLinux: ability to run `restorecon`.
 
 ---
@@ -67,160 +66,527 @@ That's it! The plugin is active automatically and ready for secure use.
 
 ---
 
-## Security Features
+## What's New in v2.1.1
 
-Version 2.0.0 includes comprehensive security enhancements:
+### 🔓 **Controlled CLI Bypass**
+- **Dual Security Model**: Strict web security + controlled CLI access
+- **Explicit Bypass Flags**: `--allow-cli` flag for intentional security bypass
+- **Environment Variables**: `CLI_NOTICE_ENABLE=1` for bulk operations
+- **Read Operations**: Status checks work without bypass flags
 
-* **Permission Validation**: All WP-CLI commands verify user capabilities
-* **Input Sanitization**: Messages are validated and sanitized with length limits (1000 chars max)
-* **XSS Prevention**: Strict HTML filtering with allowed tags only
-* **Command Injection Protection**: Direct WordPress API usage instead of shell commands
-* **Date Validation**: Proper expiration date format checking and timezone handling
-* **Error Handling**: Comprehensive validation with informative error messages
-* **Audit Logging**: All operations logged when `WP_DEBUG_LOG` is enabled
-* **Automatic Cleanup**: Options cleaned up on plugin deactivation
+### 🔒 **Enhanced Security Controls**
+- **IP Restrictions**: Whitelist specific IPs for CLI operations
+- **Time Restrictions**: Business hours only mode
+- **Advanced Logging**: Comprehensive audit trail for all CLI operations
+- **Web Security Intact**: No changes to browser/AJAX security
+
+### 📊 **Comprehensive Audit System**
+- **Mandatory Logging**: All CLI operations automatically logged
+- **Rich Context**: User, system, IP, and operation details
+- **Multiple Destinations**: WordPress debug log + custom log files
+- **Security Monitoring**: Unauthorized access attempts tracked
+
+### 🚀 **Bulk Operation Support**
+- **Multi-Site Management**: Easy bulk operations across hosted instances
+- **Automated Scripts**: Environment variable support for scripting
+- **Performance Optimized**: Cached operations for faster execution
+
+---
+
+## Security Model
+
+### Dual Security Architecture
+
+```
+┌─────────────────────┬─────────────────────┬─────────────────────┐
+│   Operation Type    │    Web Context      │    CLI Context      │
+├─────────────────────┼─────────────────────┼─────────────────────┤
+│ AJAX Notice Dismiss │ STRICT SECURITY     │ N/A                 │
+│                     │ - Nonce required    │                     │
+│                     │ - manage_options    │                     │
+├─────────────────────┼─────────────────────┼─────────────────────┤
+│ Read Operations     │ STRICT SECURITY     │ AUTOMATIC ALLOW     │
+│ (status, list)      │ - manage_options    │ - Always permitted  │
+│                     │                     │ - Logged            │
+├─────────────────────┼─────────────────────┼─────────────────────┤
+│ Write Operations    │ STRICT SECURITY     │ CONTROLLED BYPASS   │
+│ (add, update, del)  │ - manage_options    │ - Requires flag     │
+│                     │                     │ - Or env variable   │
+│                     │                     │ - Fully logged      │
+└─────────────────────┴─────────────────────┴─────────────────────┘
+```
+
+### Security Layers
+
+1. **Context Detection**: Automatically detects web vs CLI environment
+2. **Operation Classification**: Different rules for read vs write operations
+3. **Explicit Bypass**: Intentional flags required for CLI write operations
+4. **Comprehensive Logging**: Every CLI operation logged with full context
+5. **Optional Restrictions**: IP whitelisting, time controls, business hours
+
+---
+
+## CLI Bypass Features
+
+### Basic Bypass Methods
+
+#### Method 1: Explicit Flag (Recommended)
+```bash
+# Write operations require --allow-cli flag
+wp notice add "Maintenance message" --allow-cli
+wp notice update "Updated message" --allow-cli
+wp notice delete --allow-cli
+
+# Read operations work without flags
+wp notice status
+```
+```bash
+wp notice add "🔧 Scheduled maintenance tonight at 2 AM EST" --type=warning --allow-cli
+Success: Notice added successfully. Type: warning
+```
+
+#### Method 2: Environment Variable (Bulk Operations)
+```bash
+# Enable for current session
+export CLI_NOTICE_ENABLE=1
+
+# Now all operations work without flags
+wp notice add "Maintenance message"
+wp notice status
+wp notice delete
+```
+```bash
+wp notice status
+Current Notice Status:
+Message: 🔧 Scheduled maintenance tonight at 2 AM EST
+Type: warning
+Expires: Never
+```
+
+#### Method 3: WordPress Constants (Permanent)
+```php
+// In wp-config.php
+define('CLI_NOTICE_ENABLE', true);
+```
+
+### Advanced Security Controls
+
+#### IP Restrictions
+```bash
+# Environment variable
+export CLI_NOTICE_ALLOWED_IPS="192.168.1.100,10.0.0.5"
+
+# WordPress constant
+define('CLI_NOTICE_ALLOWED_IPS', '192.168.1.100,10.0.0.5');
+```
+
+#### Time Restrictions
+```bash
+# Business hours only (9 AM - 5 PM)
+export CLI_NOTICE_BUSINESS_HOURS_ONLY=1
+
+# Custom business hours
+define('CLI_NOTICE_BUSINESS_START', 8);  // 8 AM
+define('CLI_NOTICE_BUSINESS_END', 18);   // 6 PM
+```
+
+#### Custom Logging
+```bash
+# Custom log file location
+export CLI_NOTICE_LOG_FILE="/var/log/cli-notices.log"
+
+# WordPress constant
+define('CLI_NOTICE_LOG_FILE', '/var/log/cli-notices.log');
+```
 
 ---
 
 ## Usage
 
-Once installed, you can manage dashboard notices using the enhanced `wp notice` commands with built-in security validation.
+### Basic Commands
 
-### `wp notice add`
-
+#### `wp notice add`
 **Syntax:**
-
 ```bash
-wp notice add "Your message here" [--type=<type>] [--expires=<YYYY-MM-DD HH:MM:SS>]
+wp notice add "Your message here" [--type=<type>] [--expires=<YYYY-MM-DD HH:MM:SS>] [--allow-cli]
 ```
 
-**Parameters:**
-* `message` (required): Notice text (max 1000 characters)
-* `--type` (optional): Notice style - `info`, `success`, `warning`, or `error` (default: `warning`)
-* `--expires` (optional): Auto-expiry timestamp in format `YYYY-MM-DD HH:MM:SS`
-
 **Examples:**
-
 ```bash
-# Basic warning notice
-wp notice add "🔔 System maintenance scheduled"
+# Basic notice with CLI bypass
+wp notice add "🔔 System maintenance scheduled" --allow-cli
 
 # Success notice with expiration
-wp notice add "🎉 Deployment complete" --type=success --expires="2025-06-17 09:00:00"
+wp notice add "🎉 Deployment complete" --type=success --expires="2025-06-17 09:00:00" --allow-cli
 
-# Error notice that never expires
-wp notice add "❌ Critical: Database backup failed" --type=error
+# With environment variable (no flag needed)
+CLI_NOTICE_ENABLE=1 wp notice add "❌ Critical issue detected" --type=error
 ```
 
-**Sample Output:**
-```bash
-wp notice add "🔔 Hello world" --type=info --expires="2025-06-20 03:00:00"
-Success: Notice added successfully. Type: info
-```
-
-**Security Features:**
-* Validates message length and content
-* Prevents duplicate notices (must delete or update existing)
-* Validates expiration date format and ensures future dates only
-* Sanitizes HTML content with allowed tags only
-
-### `wp notice update`
-
+#### `wp notice update`
 **Syntax:**
-
 ```bash
-wp notice update "Updated message" [--type=<type>] [--expires=<YYYY-MM-DD HH:MM:SS>] [--clear-expiry]
+wp notice update "Updated message" [--type=<type>] [--expires=<YYYY-MM-DD HH:MM:SS>] [--clear-expiry] [--allow-cli]
 ```
-
-**Parameters:**
-* `message` (required): New notice text
-* `--type` (optional): Change notice type
-* `--expires` (optional): Set new expiration date
-* `--clear-expiry` (optional): Remove expiration (notice will persist until manually deleted)
 
 **Examples:**
-
 ```bash
 # Update message only
-wp notice update "🔄 Maintenance in progress"
+wp notice update "🔄 Maintenance in progress" --allow-cli
 
 # Change type and clear expiration
-wp notice update "✅ Maintenance completed" --type=success --clear-expiry
-
-# Update with new expiration
-wp notice update "⚠️ Service degraded" --type=warning --expires="2025-06-18 12:00:00"
+wp notice update "✅ Maintenance completed" --type=success --clear-expiry --allow-cli
 ```
 
-**Sample Output:**
-```bash
-wp notice update "Updated message text" --clear-expiry
-Success: Notice updated successfully. Type: warning
-```
-
-**Security Features:**
-* Requires existing notice to update
-* Validates all input parameters
-* Preserves existing settings when not specified
-* Prevents setting expiration dates in the past
-
-### `wp notice delete`
-
+#### `wp notice delete`
 **Syntax:**
-
 ```bash
-wp notice delete
+wp notice delete [--allow-cli]
 ```
 
 **Examples:**
-
 ```bash
 # Remove current notice
-wp notice delete
+wp notice delete --allow-cli
+
+# With environment variable
+CLI_NOTICE_ENABLE=1 wp notice delete
 ```
 
-**Sample Output:**
-```bash
-wp notice delete
-Success: Deleted 'temp_cli_dashboard_notice' option.
-Success: Deleted 'temp_cli_dashboard_notice_type' option.
-Success: Deleted 'temp_cli_dashboard_notice_expires' option.
-Success: Notice removal complete.
-```
-
-**Security Features:**
-* Safely removes all related options
-* Provides feedback on what was actually deleted
-* Graceful handling of missing options
-
-### `wp notice status`
-
+#### `wp notice status`
 **Syntax:**
-
 ```bash
 wp notice status
 ```
 
 **Examples:**
-
 ```bash
-# Check current notice details
+# Check current notice (no flag needed - read operation)
 wp notice status
 ```
 
 **Sample Output:**
-```bash
-wp notice status
+```
 Current Notice Status:
 Message: 🎉 Deployment successful
 Type: success
 Expires: 2025-06-17 15:30:00 (2 hours remaining)
 ```
 
-**Features:**
-* Shows complete notice information
-* Calculates and displays time remaining for expiring notices
-* Warns about expired or invalid expiration dates
-* Indicates when no notice is active
+### New Commands
+
+#### `wp notice security-status`
+Display current security configuration and settings.
+
+```bash
+wp notice security-status
+```
+
+**Sample Output:**
+```
+CLI Dashboard Notice Security Configuration:
+
+Environment CLI Enable: No
+Constant CLI Enable: Yes
+IP Restrictions (ENV): None
+IP Restrictions (CONST): 192.168.1.100,192.168.1.101
+Business Hours Only (ENV): No
+Business Hours Only (CONST): Yes
+WordPress User: admin (ID: 1)
+Can Manage Options: Yes
+System User: nginx
+
+Logging Configuration:
+WordPress Debug Log: /var/www/html/wp-content/debug.log
+Custom Log File: /var/log/cli-notices.log
+
+Security Recommendations:
+⚠️ CLI bypass enabled - Review security settings
+💡 Consider enabling business hours restrictions
+```
+
+#### `wp notice enable-cli`
+Get instructions for enabling CLI bypass temporarily.
+
+```bash
+wp notice enable-cli --confirm [--ip-whitelist=<ips>] [--business-hours-only]
+```
+
+**Example:**
+```bash
+wp notice enable-cli --confirm --ip-whitelist="192.168.1.100" --business-hours-only
+```
+
+---
+
+## Bulk Operations
+
+### Simple Bulk Script
+
+```bash
+#!/bin/bash
+# bulk-notice.sh - Simple bulk notice management
+
+# Configuration
+SITES_FILE="sites.txt"  # One site path per line
+OPERATION="$1"
+MESSAGE="$2"
+TYPE="${3:-warning}"
+EXPIRES="$4"
+
+# Enable CLI bypass
+export CLI_NOTICE_ENABLE=1
+
+# Function to process all sites
+process_sites() {
+    local cmd="$1"
+    local success=0
+    local errors=0
+    
+    while IFS= read -r site_path; do
+        [[ -z "$site_path" || "$site_path" =~ ^[[:space:]]*# ]] && continue
+        
+        echo "Processing: $site_path"
+        if cd "$site_path" && wp core is-installed 2>/dev/null; then
+            if eval "$cmd"; then
+                ((success++))
+                echo "✅ Success: $site_path"
+            else
+                ((errors++))
+                echo "❌ Error: $site_path"
+            fi
+        else
+            ((errors++))
+            echo "❌ Invalid WordPress: $site_path"
+        fi
+    done < "$SITES_FILE"
+    
+    echo "Complete: $success successful, $errors errors"
+}
+
+# Main operations
+case "$OPERATION" in
+    "add")
+        if [ -n "$EXPIRES" ]; then
+            process_sites "wp notice add \"$MESSAGE\" --type=$TYPE --expires=\"$EXPIRES\""
+        else
+            process_sites "wp notice add \"$MESSAGE\" --type=$TYPE"
+        fi
+        ;;
+    "update")
+        process_sites "wp notice update \"$MESSAGE\" --type=$TYPE"
+        ;;
+    "delete"|"cleanup")
+        process_sites "wp notice delete"
+        ;;
+    "status")
+        process_sites "wp notice status"
+        ;;
+    *)
+        echo "Usage: $0 {add|update|delete|status} [message] [type] [expires]"
+        echo "Examples:"
+        echo "  $0 add \"Maintenance tonight\" warning \"2025-06-17 02:00:00\""
+        echo "  $0 status"
+        echo "  $0 delete"
+        exit 1
+        ;;
+esac
+```
+
+### Sites Configuration File (sites.txt)
+
+```bash
+# sites.txt - WordPress installation paths
+/home/nginx/domains/site1.com/public
+/home/nginx/domains/site2.com/public
+/home/nginx/domains/site3.com/public
+```
+
+### Auto-Discovery Script
+
+```bash
+#!/bin/bash
+# discover-sites.sh - Automatically find WordPress installations
+
+echo "Discovering WordPress installations..."
+find /home/nginx/domains/*/public -name "wp-config.php" -exec dirname {} \; > sites.txt
+
+echo "Found $(wc -l < sites.txt) WordPress installations:"
+cat sites.txt
+
+# Test first site
+FIRST_SITE=$(head -1 sites.txt)
+if [ -n "$FIRST_SITE" ]; then
+    echo "Testing first site: $FIRST_SITE"
+    cd "$FIRST_SITE"
+    if CLI_NOTICE_ENABLE=1 wp notice add "Discovery test" --type=info; then
+        echo "✅ Test successful"
+        CLI_NOTICE_ENABLE=1 wp notice delete
+    else
+        echo "❌ Test failed"
+    fi
+fi
+```
+
+### Usage Examples
+
+```bash
+# Setup
+chmod +x bulk-notice.sh discover-sites.sh
+./discover-sites.sh
+
+# Add maintenance notice to all sites
+./bulk-notice.sh add "🔧 Scheduled maintenance tonight 2-4 AM EST" warning "2025-06-18 02:00:00"
+
+# Check status across all sites
+./bulk-notice.sh status
+
+# Update all notices
+./bulk-notice.sh update "✅ Maintenance completed successfully" success
+
+# Clean up all notices
+./bulk-notice.sh delete
+```
+
+---
+
+## Security Configuration
+
+### Production Environment Setup
+
+#### Recommended Configuration
+```php
+// wp-config.php - Production security settings
+define('CLI_NOTICE_ENABLE', true);                    // Enable CLI bypass
+define('CLI_NOTICE_ALLOWED_IPS', '192.168.1.100');   // Restrict to admin server
+define('CLI_NOTICE_BUSINESS_HOURS_ONLY', true);      // Business hours only
+define('CLI_NOTICE_LOG_FILE', '/var/log/cli-notices.log');  // Centralized logging
+
+// Custom business hours (optional)
+define('CLI_NOTICE_BUSINESS_START', 8);   // 8 AM
+define('CLI_NOTICE_BUSINESS_END', 18);    // 6 PM
+```
+
+#### Environment Variables (Alternative)
+```bash
+# For shell sessions or scripts
+export CLI_NOTICE_ENABLE=1
+export CLI_NOTICE_ALLOWED_IPS="192.168.1.100,10.0.0.5"
+export CLI_NOTICE_BUSINESS_HOURS_ONLY=1
+export CLI_NOTICE_LOG_FILE="/var/log/cli-notices.log"
+```
+
+### Security Levels
+
+#### Maximum Security (Default)
+```bash
+# No CLI bypass enabled
+# Requires --allow-cli flag for each write operation
+wp notice add "Message" --allow-cli
+wp notice status                    # Read operations always work
+```
+
+#### Controlled Access
+```bash
+# IP-restricted CLI bypass
+export CLI_NOTICE_ENABLE=1
+export CLI_NOTICE_ALLOWED_IPS="192.168.1.100"
+wp notice add "Message"    # Works without flag, but only from allowed IP
+```
+
+#### Development Environment
+```bash
+# Full CLI access (development only)
+export CLI_NOTICE_ENABLE=1
+wp notice add "Message"    # Works without restrictions
+```
+
+### WordPress Filters
+
+```php
+// Conditional CLI bypass based on environment
+add_filter('cli_notice_allow_cli_bypass', function($allowed, $operation) {
+    // Only allow on staging/development
+    if (wp_get_environment_type() === 'production') {
+        return false;
+    }
+    return $allowed;
+}, 10, 2);
+
+// Custom audit logging
+add_filter('cli_notice_audit_data', function($data, $operation) {
+    $data['deployment_id'] = getenv('DEPLOYMENT_ID') ?: 'unknown';
+    return $data;
+}, 10, 2);
+```
+
+---
+
+## Audit Logging
+
+### Automatic Logging
+
+All CLI operations are automatically logged with comprehensive context:
+
+```json
+{
+  "timestamp": "2025-06-16 14:30:15",
+  "operation": "Notice added",
+  "wp_user_id": "cli-no-user",
+  "system_user": "nginx",
+  "server_ip": "192.168.1.100",
+  "wp_cli_version": "2.8.1",
+  "php_version": "8.1.0",
+  "wp_version": "6.2",
+  "bypass_method": "flag",
+  "type": "warning",
+  "expires": "2025-06-17 02:00:00"
+}
+```
+
+### Log Destinations
+
+#### WordPress Debug Log
+Automatically logged when `WP_DEBUG_LOG` is enabled:
+```php
+// wp-config.php
+define('WP_DEBUG', true);
+define('WP_DEBUG_LOG', true);
+define('WP_DEBUG_DISPLAY', false);
+```
+
+**Location:** `wp-content/debug.log`
+
+#### Custom Log File
+```bash
+# Environment variable
+export CLI_NOTICE_LOG_FILE="/var/log/cli-notices.log"
+
+# WordPress constant
+define('CLI_NOTICE_LOG_FILE', '/var/log/cli-notices.log');
+```
+
+#### Custom Logging Hook
+```php
+// Custom logging integration
+add_action('cli_dashboard_notice_audit_log', function($message, $audit_data) {
+    // Send to external SIEM system
+    error_log("SECURITY_AUDIT: $message - " . json_encode($audit_data));
+    
+    // Send to monitoring service
+    wp_remote_post('https://monitoring.example.com/audit', [
+        'body' => json_encode($audit_data)
+    ]);
+}, 10, 2);
+```
+
+### Sample Log Entries
+
+```
+2025-06-16 14:30:15 CLI Dashboard Notice: CLI operation attempted: add | Context: {"bypass_method":"checking","args":["allow-cli"]}
+2025-06-16 14:30:15 CLI Dashboard Notice: CLI bypass granted for: add | Context: {"bypass_method":"flag","flag_present":true,"env_enabled":false}
+2025-06-16 14:30:15 CLI Dashboard Notice: Notice added | Context: {"type":"warning","expires":"never","message_length":45,"user_id":"cli-no-user"}
+```
 
 ---
 
@@ -229,106 +595,116 @@ Expires: 2025-06-17 15:30:00 (2 hours remaining)
 ### Basic Operations
 
 ```bash
-# Add a simple maintenance notice
-wp notice add "🔧 Scheduled maintenance tonight at 2 AM EST" --type=warning
+# Simple maintenance notice
+wp notice add "🔧 System maintenance in progress" --type=warning --allow-cli
 
-# Check what's currently active
+# Check current status (no flag needed)
 wp notice status
 
-# Update for immediate maintenance
-wp notice update "🚨 Emergency maintenance in progress" --type=error
+# Update to completion
+wp notice update "✅ Maintenance completed" --type=success --allow-cli
 
-# Clear when done
-wp notice delete
+# Clean up
+wp notice delete --allow-cli
 ```
 
 ### Deployment Workflow
 
 ```bash
+#!/bin/bash
+# deployment-notice.sh - Deployment notification workflow
+
+export CLI_NOTICE_ENABLE=1
+VERSION="$1"
+
 # Start deployment notice
-wp notice add "🚀 Deployment starting..." --type=info --expires="2025-06-17 14:00:00"
+wp notice add "🚀 Deploying version $VERSION..." --type=info --expires="$(date -d '+30 minutes' '+%Y-%m-%d %H:%M:%S')"
 
-# Update during deployment
-wp notice update "⏳ Deployment in progress - database migration" --type=warning
+# Run deployment
+echo "Running deployment..."
+./deploy.sh
 
-# Success notification
-wp notice update "✅ Deployment completed successfully" --type=success --expires="2025-06-17 15:00:00"
-
-# Auto-expires in 1 hour, or manually remove
-wp notice delete
+# Update based on result
+if [ $? -eq 0 ]; then
+    wp notice update "✅ Version $VERSION deployed successfully" --type=success --expires="$(date -d '+1 hour' '+%Y-%m-%d %H:%M:%S')"
+    echo "Deployment successful"
+else
+    wp notice update "❌ Deployment failed - check logs" --type=error
+    echo "Deployment failed"
+    exit 1
+fi
 ```
 
 ### Emergency Notifications
 
 ```bash
-# Critical system alert (no expiry)
-wp notice add "🚨 CRITICAL: Payment system down - investigating" --type=error
+#!/bin/bash
+# emergency-alert.sh - Emergency notification system
 
-# Update with progress
-wp notice update "🔧 Payment system restored - monitoring for stability" --type=warning --expires="2025-06-17 18:00:00"
+export CLI_NOTICE_ENABLE=1
+ALERT_MESSAGE="$1"
+DURATION="${2:-60}"  # minutes
 
-# Final confirmation
-wp notice update "✅ All systems operational" --type=success --expires="2025-06-17 17:00:00"
+# Calculate expiration
+EXPIRE_TIME=$(date -d "+${DURATION} minutes" '+%Y-%m-%d %H:%M:%S')
+
+# Send to all sites
+while IFS= read -r site_path; do
+    echo "Sending emergency alert to: $site_path"
+    cd "$site_path"
+    wp notice add "🚨 EMERGENCY: $ALERT_MESSAGE" --type=error --expires="$EXPIRE_TIME"
+done < sites.txt
+
+echo "Emergency alert sent to all sites, expires: $EXPIRE_TIME"
 ```
 
-### Scheduled Maintenance
+### Maintenance Window Management
 
 ```bash
-# Advance notice (expires right before maintenance)
-wp notice add "📅 Scheduled maintenance: Tomorrow 2-4 AM EST" --type=info --expires="2025-06-18 02:00:00"
+#!/bin/bash
+# maintenance-window.sh - Automated maintenance notifications
 
-# During maintenance window
-wp notice add "🔧 Maintenance in progress - expect brief interruptions" --type=warning --expires="2025-06-18 04:00:00"
+export CLI_NOTICE_ENABLE=1
 
-# Maintenance complete
-wp notice add "✅ Maintenance completed - all systems normal" --type=success --expires="2025-06-18 06:00:00"
+START_TIME="$1"  # Format: "2025-06-18 02:00:00"
+END_TIME="$2"    # Format: "2025-06-18 04:00:00"
+
+if [ -z "$START_TIME" ] || [ -z "$END_TIME" ]; then
+    echo "Usage: $0 'YYYY-MM-DD HH:MM:SS' 'YYYY-MM-DD HH:MM:SS'"
+    exit 1
+fi
+
+# Advance notice (24 hours before)
+ADVANCE_TIME=$(date -d "$START_TIME - 24 hours" '+%Y-%m-%d %H:%M:%S')
+echo "Schedule this command for $ADVANCE_TIME:"
+echo "  $0 advance '$START_TIME' '$END_TIME'"
+
+# Maintenance operations
+case "${3:-start}" in
+    "advance")
+        # 24 hours advance notice
+        MESSAGE="📅 Scheduled maintenance: $(date -d "$START_TIME" '+%B %d at %I:%M %p')"
+        while IFS= read -r site; do
+            cd "$site" && wp notice add "$MESSAGE" --type=info --expires="$START_TIME"
+        done < sites.txt
+        ;;
+    "start")
+        # Maintenance starting
+        MESSAGE="🔧 Maintenance in progress - expect brief interruptions"
+        while IFS= read -r site; do
+            cd "$site" && wp notice add "$MESSAGE" --type=warning --expires="$END_TIME"
+        done < sites.txt
+        ;;
+    "complete")
+        # Maintenance completed
+        MESSAGE="✅ Maintenance completed - all systems operational"
+        COMPLETE_EXPIRE=$(date -d "$END_TIME + 2 hours" '+%Y-%m-%d %H:%M:%S')
+        while IFS= read -r site; do
+            cd "$site" && wp notice add "$MESSAGE" --type=success --expires="$COMPLETE_EXPIRE"
+        done < sites.txt
+        ;;
+esac
 ```
-
----
-
-## Security Considerations
-
-### Permission Requirements
-
-* WP-CLI commands require WordPress context with `manage_options` capability
-* File system access needed for plugin installation
-* Commands are logged when `WP_DEBUG_LOG` is enabled
-
-### Input Validation
-
-* Messages limited to 1000 characters
-* HTML content filtered to safe tags only: `<strong>`, `<em>`, `<code>`, `<br>`, `<a>`
-* Expiration dates must be in future and valid format
-* Notice types restricted to predefined values
-
-### Allowed HTML Tags
-
-The plugin allows these HTML tags in messages for basic formatting:
-
-```html
-<strong>Bold text</strong>
-<em>Italic text</em>
-<code>Code snippets</code>
-<br> <!-- Line breaks -->
-<a href="https://example.com" title="Link title">Link text</a>
-```
-
-### Best Practices
-
-1. **Use appropriate notice types**:
-   - `info`: General information, announcements
-   - `success`: Completed actions, confirmations
-   - `warning`: Important notices, upcoming events
-   - `error`: Critical issues, failures
-
-2. **Set reasonable expiration times**:
-   - Short-term: 1-4 hours for immediate issues
-   - Medium-term: 1-2 days for scheduled events
-   - Long-term: 1 week maximum for general announcements
-
-3. **Keep messages concise and actionable**
-4. **Use emojis sparingly for visual impact**
-5. **Always clean up notices when issues are resolved**
 
 ---
 
@@ -336,157 +712,213 @@ The plugin allows these HTML tags in messages for basic formatting:
 
 ### Common Issues
 
-* **"Insufficient permissions" error:**
-  * Ensure your WordPress user has `manage_options` capability
-  * Verify WP-CLI is running in correct WordPress context
-  * Check file permissions on WordPress directory
-
-* **"Invalid expiration date format" error:**
-  * Use exact format: `YYYY-MM-DD HH:MM:SS`
-  * Example: `2025-06-17 14:30:00`
-  * Ensure date is in the future
-
-* **"Message too long" error:**
-  * Keep messages under 1000 characters
-  * Use concise, actionable language
-  * Move detailed information to external documentation
-
-* **Notice not appearing in dashboard:**
-  * Verify you have `manage_options` capability
-  * Check if notice has expired: `wp notice status`
-  * Ensure message exists: `wp option get temp_cli_dashboard_notice`
-
-* **HTML not rendering correctly:**
-  * Use only allowed HTML tags
-  * Check HTML syntax and proper tag closure
-  * Test with simple text first, then add formatting
-
-### Debug Information
-
-Enable WordPress debug logging to see detailed operation logs:
-
-```php
-// In wp-config.php
-define( 'WP_DEBUG', true );
-define( 'WP_DEBUG_LOG', true );
-define( 'WP_DEBUG_DISPLAY', false );
+#### Permission Errors
+```bash
+# Error: "CLI write operation requires --allow-cli flag"
+# Solution: Add the flag or enable environment variable
+wp notice add "Message" --allow-cli
+# OR
+CLI_NOTICE_ENABLE=1 wp notice add "Message"
 ```
 
-Check logs at: `wp-content/debug.log`
+#### IP Restriction Issues
+```bash
+# Error: "CLI operations not allowed from IP"
+# Check current IP restrictions
+wp notice security-status
 
-### SELinux Issues (AlmaLinux/RHEL)
+# Temporarily disable IP restrictions
+unset CLI_NOTICE_ALLOWED_IPS
+# OR add your IP
+export CLI_NOTICE_ALLOWED_IPS="192.168.1.100,$(curl -s ifconfig.me)"
+```
 
-If notices don't appear on SELinux systems:
+#### Business Hours Restrictions
+```bash
+# Error: "CLI operations only allowed during business hours"
+# Check current time and settings
+wp notice security-status
+
+# Temporarily disable time restrictions
+unset CLI_NOTICE_BUSINESS_HOURS_ONLY
+```
+
+#### No WordPress User Context
+```bash
+# Warning in logs: "cli-no-user"
+# This is normal for CLI operations without --user flag
+# To use WordPress user context:
+wp notice add "Message" --user=admin --allow-cli
+```
+
+### Debug Commands
 
 ```bash
-# Check SELinux context
-ls -Z wp-content/mu-plugins/
+# Check plugin installation
+ls -la wp-content/mu-plugins/cli-notice.php
 
-# Restore proper context
-restorecon -Rv wp-content/mu-plugins/
+# Verify WordPress installation
+wp core is-installed
 
-# Check for SELinux denials
-grep "cli-notice" /var/log/audit/audit.log
+# Check security configuration
+wp notice security-status
+
+# Test basic functionality
+wp notice status
+CLI_NOTICE_ENABLE=1 wp notice add "Test" --type=info
+wp notice status
+CLI_NOTICE_ENABLE=1 wp notice delete
+```
+
+### Log Analysis
+
+```bash
+# Check WordPress debug log
+tail -f wp-content/debug.log | grep "CLI Dashboard Notice"
+
+# Check custom log file
+tail -f /var/log/cli-notices.log
+
+# Search for specific operations
+grep "Notice added" wp-content/debug.log
+grep "CLI bypass granted" wp-content/debug.log
+```
+
+### Performance Issues
+
+```bash
+# Check for multiple database queries
+wp notice status --debug
+
+# Clear notice cache if issues persist
+wp cache flush
+
+# Verify option cleanup
+wp option list | grep temp_cli_dashboard_notice
 ```
 
 ---
 
 ## Advanced Features
 
-### Integration with CI/CD Pipelines
+### CI/CD Integration
+
+```yaml
+# .github/workflows/deploy.yml - GitHub Actions example
+name: Deploy with Notifications
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      
+      - name: Start Deployment Notice
+        run: |
+          ssh ${{ secrets.SERVER_HOST }} "
+            export CLI_NOTICE_ENABLE=1
+            cd /var/www/html
+            wp notice add '🚀 Deploying ${GITHUB_SHA:0:7}...' --type=info --expires='$(date -d '+30 minutes' '+%Y-%m-%d %H:%M:%S')'
+          "
+      
+      - name: Deploy Application
+        run: |
+          # Your deployment commands here
+          echo "Deploying..."
+      
+      - name: Update Success Notice
+        if: success()
+        run: |
+          ssh ${{ secrets.SERVER_HOST }} "
+            export CLI_NOTICE_ENABLE=1
+            cd /var/www/html
+            wp notice update '✅ Deployment ${GITHUB_SHA:0:7} completed' --type=success --expires='$(date -d '+1 hour' '+%Y-%m-%d %H:%M:%S')'
+          "
+      
+      - name: Update Failure Notice
+        if: failure()
+        run: |
+          ssh ${{ secrets.SERVER_HOST }} "
+            export CLI_NOTICE_ENABLE=1
+            cd /var/www/html
+            wp notice update '❌ Deployment ${GITHUB_SHA:0:7} failed' --type=error
+          "
+```
+
+### Monitoring Integration
 
 ```bash
 #!/bin/bash
-# deployment-notice.sh
+# monitor-notices.sh - Notice monitoring script
 
-# Start deployment
-wp notice add "🚀 Deploying version $VERSION" --type=info --expires="$(date -d '+2 hours' '+%Y-%m-%d %H:%M:%S')"
+LOG_FILE="/var/log/cli-notices.log"
+ALERT_WEBHOOK="https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK"
 
-# Your deployment commands here
-./deploy.sh
-
-# Update based on result
-if [ $? -eq 0 ]; then
-    wp notice update "✅ Version $VERSION deployed successfully" --type=success --expires="$(date -d '+1 hour' '+%Y-%m-%d %H:%M:%S')"
-else
-    wp notice update "❌ Deployment failed - rolling back" --type=error
-fi
+# Monitor for security events
+tail -F "$LOG_FILE" | while read line; do
+    # Alert on CLI bypass usage
+    if echo "$line" | grep -q "CLI bypass granted"; then
+        curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"🔓 CLI bypass used: '"$line"'"}' \
+            "$ALERT_WEBHOOK"
+    fi
+    
+    # Alert on failed operations
+    if echo "$line" | grep -q "operation blocked"; then
+        curl -X POST -H 'Content-type: application/json' \
+            --data '{"text":"🚨 CLI operation blocked: '"$line"'"}' \
+            "$ALERT_WEBHOOK"
+    fi
+done
 ```
 
-### Automated Maintenance Windows
-
-```bash
-#!/bin/bash
-# maintenance-window.sh
-
-START_TIME="2025-06-18 02:00:00"
-END_TIME="2025-06-18 04:00:00"
-
-# Schedule advance notice
-wp notice add "📅 Maintenance scheduled: $(date -d "$START_TIME" '+%b %d at %I:%M %p')" --type=info --expires="$START_TIME"
-
-# During maintenance (run from cron at start time)
-wp notice add "🔧 Maintenance in progress" --type=warning --expires="$END_TIME"
-
-# Completion notice (run from cron at end time)
-wp notice add "✅ Maintenance completed" --type=success --expires="$(date -d "$END_TIME + 2 hours" '+%Y-%m-%d %H:%M:%S')"
-```
-
-### WordPress Hooks Integration
+### WordPress Multisite Support
 
 ```php
-// In your theme's functions.php or custom plugin
-add_action( 'wp_ajax_custom_deploy_start', function() {
-    if ( current_user_can( 'manage_options' ) ) {
-        WP_CLI::runcommand( 'notice add "🚀 Custom deployment initiated" --type=info' );
+// Network-wide notice management
+function network_notice_add($message, $type = 'warning', $expires = null) {
+    $sites = get_sites();
+    
+    foreach ($sites as $site) {
+        switch_to_blog($site->blog_id);
+        
+        // Use WP-CLI programmatically
+        WP_CLI::runcommand(sprintf(
+            'notice add "%s" --type=%s %s',
+            addslashes($message),
+            $type,
+            $expires ? '--expires="' . $expires . '"' : ''
+        ), array('launch' => false, 'return' => true));
+        
+        restore_current_blog();
     }
+}
+
+// Usage
+network_notice_add('Network-wide maintenance notice', 'warning', '2025-06-17 02:00:00');
+```
+
+### Custom Notice Types
+
+```php
+// Extend valid notice types
+add_filter('cli_dashboard_notice_valid_types', function($types) {
+    return array_merge($types, ['maintenance', 'security', 'announcement']);
+});
+
+// Custom styling for new types
+add_action('admin_head', function() {
+    echo '<style>
+        .notice-maintenance { border-left-color: #ff6600; }
+        .notice-security { border-left-color: #cc0000; }
+        .notice-announcement { border-left-color: #0066cc; }
+    </style>';
 });
 ```
-
-### Status Monitoring
-
-```bash
-#!/bin/bash
-# check-notice-status.sh
-
-STATUS=$(wp notice status 2>/dev/null)
-
-if echo "$STATUS" | grep -q "No active notice"; then
-    echo "No notices active"
-    exit 0
-elif echo "$STATUS" | grep -q "Expired:"; then
-    echo "Notice has expired - cleaning up"
-    wp notice delete
-else
-    echo "Active notice found:"
-    echo "$STATUS"
-fi
-```
-
----
-
-## Migration from v1.x
-
-If upgrading from version 1.x, no data migration is needed. However, be aware of these changes:
-
-### Breaking Changes
-
-1. **Command validation**: v2.0 has stricter input validation
-2. **Permission requirements**: All commands now check capabilities
-3. **Error handling**: More informative error messages, some scripts may need updating
-
-### Recommended Updates
-
-1. **Update automation scripts** to handle new error messages
-2. **Add error checking** to existing scripts using the plugin
-3. **Review message content** to ensure compliance with 1000-character limit
-4. **Test expiration date formats** with new validation
-
-### Compatibility
-
-* All existing notices will continue to work
-* WP-CLI command syntax remains the same
-* Option names unchanged for backward compatibility
 
 ---
 
@@ -498,36 +930,71 @@ If upgrading from version 1.x, no data migration is needed. However, be aware of
 * `temp_cli_dashboard_notice_type`: Notice type (info, success, warning, error)  
 * `temp_cli_dashboard_notice_expires`: Expiration timestamp (YYYY-MM-DD HH:MM:SS format)
 
+### Environment Variables
+
+* `CLI_NOTICE_ENABLE`: Enable CLI bypass (1 or 0)
+* `CLI_NOTICE_ALLOWED_IPS`: Comma-separated list of allowed IPs
+* `CLI_NOTICE_BUSINESS_HOURS_ONLY`: Enable business hours restriction (1 or 0)
+* `CLI_NOTICE_LOG_FILE`: Custom log file path
+* `CLI_NOTICE_BUSINESS_START`: Business hours start (default: 9)
+* `CLI_NOTICE_BUSINESS_END`: Business hours end (default: 17)
+
+### WordPress Constants
+
+```php
+define('CLI_NOTICE_ENABLE', true);                    // Enable CLI bypass
+define('CLI_NOTICE_ALLOWED_IPS', '192.168.1.100');   // IP restrictions
+define('CLI_NOTICE_BUSINESS_HOURS_ONLY', true);      // Time restrictions
+define('CLI_NOTICE_LOG_FILE', '/var/log/cli-notices.log');  // Custom log
+define('CLI_NOTICE_BUSINESS_START', 8);              // Business start hour
+define('CLI_NOTICE_BUSINESS_END', 18);               // Business end hour
+```
+
 ### WordPress Hooks
 
-* `admin_notices`: Displays the notice in admin dashboard
-* `register_deactivation_hook`: Cleans up options when plugin deactivated
+```php
+// Control CLI bypass programmatically
+add_filter('cli_notice_allow_cli_bypass', function($allowed, $operation) {
+    return $allowed;
+}, 10, 2);
 
-### Constants
+// Modify audit log data
+add_filter('cli_notice_audit_data', function($data, $operation) {
+    return $data;
+}, 10, 2);
 
-* `CLI_Dashboard_Notice::MAX_MESSAGE_LENGTH`: 1000 characters
-* `CLI_Dashboard_Notice::VALID_TYPES`: ['info', 'success', 'warning', 'error']
-* `CLI_Dashboard_Notice::OPTION_PREFIX`: 'temp_cli_dashboard_notice'
+// Custom audit log handling
+add_action('cli_dashboard_notice_audit_log', function($message, $audit_data) {
+    // Custom logging logic
+}, 10, 2);
+```
+
+### Error Codes
+
+* `cli_bypass_required`: Write operation needs --allow-cli flag
+* `ip_blocked`: IP address not in whitelist
+* `outside_business_hours`: Operation outside allowed time
+* `insufficient_permissions`: User lacks required capabilities
+* `notice_exists`: Attempting to add when notice already exists
+* `no_notice_exists`: Attempting to update non-existent notice
 
 ---
 
 ## Support and Contributing
 
-For issues, feature requests, or contributions:
+### Getting Help
 
 * **GitHub Repository**: https://github.com/centminmod/centminmod-mu-plugins
-* **Documentation**: This README file
-* **Security Issues**: Please report privately to the maintainers
+* **Documentation**: This README file and inline PHPDoc
+* **Security Issues**: Please report privately to maintainers
 
 ### Version History
 
-* **v2.0.0**: Complete security rewrite with enhanced validation
-* **v1.2.0**: Basic functionality with expiration support
-* **v1.1.0**: Added notice types
-* **v1.0.0**: Initial release
+* **v2.1.1**: CLI bypass functionality with enhanced security controls
+* **v2.1.0**: Security fixes, performance optimizations, enhanced error handling
+* **v2.0.0**: Complete security rewrite with enhanced validation  
 
----
+### Contributing Guidelines
 
-## License
-
-This plugin is licensed under the GPLv2 or later license. You are free to use, modify, and distribute it according to the terms of the license.
+1. **Security First**: All contributions undergo security review
+2. **Comprehensive Testing**: Test with
