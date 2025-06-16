@@ -407,6 +407,7 @@ CLI_Dashboard_Notice::init();
  *     wp notice delete --allow-cli
  *     wp notice status                    # Read operations don't need --allow-cli
  *     wp notice cleanup --allow-cli
+ *     wp notice security_status          # Check security configuration
  *
  *     # With environment variable (for bulk operations)
  *     CLI_NOTICE_ENABLE=1 wp notice add "🔔 Hello world" --type=info
@@ -567,7 +568,7 @@ class CLI_Notice_Command {
             $current_user = wp_get_current_user();
             
             // For read operations in CLI, allow without user context
-            if ( in_array( $operation, [ 'status', 'list' ], true ) ) {
+            if ( in_array( $operation, [ 'status', 'list', 'security_status' ], true ) ) {
                 CLI_Dashboard_Notice::cli_audit_log( "CLI read operation allowed: {$operation}" );
                 return true;
             }
@@ -843,7 +844,10 @@ class CLI_Notice_Command {
      * Show CLI bypass configuration and security status.
      */
     public function security_status() {
-        // This is always a read operation
+        // This is always a read operation - use underscore method name for WP-CLI
+        $permission_check = $this->check_permissions( 'security_status', [] );
+        $this->handle_result( $permission_check );
+        
         WP_CLI::log( __( 'CLI Dashboard Notice Security Configuration:', 'cli-dashboard-notice' ) );
         WP_CLI::log( '' );
         

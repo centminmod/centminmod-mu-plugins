@@ -259,12 +259,6 @@ CLI_NOTICE_ENABLE=1 wp notice delete
 wp notice status
 ```
 
-**Examples:**
-```bash
-# Check current notice (no flag needed - read operation)
-wp notice status
-```
-
 **Sample Output:**
 ```
 Current Notice Status:
@@ -275,11 +269,11 @@ Expires: 2025-06-17 15:30:00 (2 hours remaining)
 
 ### New Commands
 
-#### `wp notice security-status`
+#### `wp notice security_status`
 Display current security configuration and settings.
 
 ```bash
-wp notice security-status
+wp notice security_status
 ```
 
 **Sample Output:**
@@ -725,7 +719,7 @@ CLI_NOTICE_ENABLE=1 wp notice add "Message"
 ```bash
 # Error: "CLI operations not allowed from IP"
 # Check current IP restrictions
-wp notice security-status
+wp notice security_status
 
 # Temporarily disable IP restrictions
 unset CLI_NOTICE_ALLOWED_IPS
@@ -737,7 +731,7 @@ export CLI_NOTICE_ALLOWED_IPS="192.168.1.100,$(curl -s ifconfig.me)"
 ```bash
 # Error: "CLI operations only allowed during business hours"
 # Check current time and settings
-wp notice security-status
+wp notice security_status
 
 # Temporarily disable time restrictions
 unset CLI_NOTICE_BUSINESS_HOURS_ONLY
@@ -761,7 +755,7 @@ ls -la wp-content/mu-plugins/cli-notice.php
 wp core is-installed
 
 # Check security configuration
-wp notice security-status
+wp notice security_status
 
 # Test basic functionality
 wp notice status
