@@ -40,7 +40,11 @@ class CLI_Dashboard_Notice {
     public static function init() {
         add_action( 'admin_notices', [ __CLASS__, 'display_admin_notice' ] );
         
-        // MU-plugins don't fire deactivation hooks, so we use uninstall hook instead
+        // For MU-plugins, the uninstall hook is not guaranteed to fire.
+        // It only runs if the plugin file is manually deleted from the filesystem
+        // AND an administrator subsequently visits the main Plugins page in the admin area.
+        // Therefore, this is a fallback mechanism. The primary method for removing
+        // the notice options from the database is the `wp notice delete` command.
         register_uninstall_hook( __FILE__, [ __CLASS__, 'cleanup_options' ] );
         
         // Add AJAX handler for notice dismissal
