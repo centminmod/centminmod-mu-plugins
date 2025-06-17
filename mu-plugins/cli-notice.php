@@ -122,17 +122,8 @@ class CLI_Dashboard_Notice {
      * @return int Next available ID
      */
     public static function get_next_id() {
-        $next_id = get_option( self::INDEX_OPTION, 1 );
-        
-        // Find first available slot (handle gaps from deleted notices)
-        for ( $i = $next_id; $i <= self::MAX_NOTICES; $i++ ) {
-            if ( get_option( self::OPTION_PREFIX . '_' . $i ) === false ) {
-                return $i;
-            }
-        }
-        
-        // If no gaps found, check from beginning
-        for ( $i = 1; $i < $next_id; $i++ ) {
+        // Always check for gaps from ID 1 first (prioritize reusing deleted notice IDs)
+        for ( $i = 1; $i <= self::MAX_NOTICES; $i++ ) {
             if ( get_option( self::OPTION_PREFIX . '_' . $i ) === false ) {
                 return $i;
             }
