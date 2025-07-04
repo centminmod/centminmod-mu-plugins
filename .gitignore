@@ -1,8 +1,18 @@
-.env
-.claude
 CLAUDE-activeContext.md
 CLAUDE-decisions.md
 CLAUDE-patterns.md
 CLAUDE-temp.md
 CLAUDE.md
 GEMINI.md
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# uv
+.env
+.claude
+.venv/
+.claude-trace/
+.cfai-gateway

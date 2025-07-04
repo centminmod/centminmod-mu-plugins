@@ -6,7 +6,7 @@
  *   - Support for up to 10 concurrent notices with auto-ID assignment
  *   - Individual expiration, types, and dismissal for each notice
  *   - Backward compatible with existing single-notice installations
- * Version: 2.2.0
+ * Version: 2.2.1
  * Author: CLI
  * Author URI: https://centminmod.com
  * License: GPLv2 or later
@@ -89,29 +89,17 @@ class CLI_Dashboard_Notice {
     public static function get_all_notices() {
         $notices = [];
         
-        // Check for legacy single notice first
-        $legacy_message = get_option( self::OPTION_PREFIX );
-        if ( $legacy_message !== false ) {
-            $notices[0] = [
-                'id' => 0,
-                'message' => $legacy_message,
-                'type' => get_option( self::OPTION_PREFIX . '_type', 'warning' ),
-                'expires' => get_option( self::OPTION_PREFIX . '_expires' )
-            ];
+        // Check for legacy single notice first with caching
+        $legacy_notice = self::get_legacy_notice_cached();
+        if ( $legacy_notice !== false ) {
+            $notices[0] = $legacy_notice;
         }
         
-        // Check for indexed notices
-        for ( $i = 1; $i <= self::MAX_NOTICES; $i++ ) {
-            $message = get_option( self::OPTION_PREFIX . '_' . $i );
-            if ( $message !== false ) {
-                $notices[$i] = [
-                    'id' => $i,
-                    'message' => $message,
-                    'type' => get_option( self::OPTION_PREFIX . '_' . $i . '_type', 'warning' ),
-                    'expires' => get_option( self::OPTION_PREFIX . '_' . $i . '_expires' )
-                ];
-            }
-        }
+        // Optimized batch loading of indexed notices
+        $indexed_notices = self::get_indexed_notices_optimized();
+        
+        // Use + operator instead of array_merge to preserve keys
+        $notices = $notices + $indexed_notices;
         
         return $notices;
     }
@@ -122,14 +110,175 @@ class CLI_Dashboard_Notice {
      * @return int Next available ID
      */
     public static function get_next_id() {
-        // Always check for gaps from ID 1 first (prioritize reusing deleted notice IDs)
+        // Check cache first for performance
+        $cache_key = 'cli_dashboard_notices_next_id';
+        $cached_next_id = wp_cache_get( $cache_key, 'cli_notices' );
+        
+        if ( false !== $cached_next_id ) {
+            return $cached_next_id;
+        }
+        
+        // Optimized gap detection using single database query
+        global $wpdb;
+        $option_prefix = self::OPTION_PREFIX;
+        
+        $used_ids = $wpdb->get_col(
+            $wpdb->prepare(
+                "SELECT CAST(SUBSTRING(option_name, %d) AS UNSIGNED) as notice_id 
+                 FROM {$wpdb->options} 
+                 WHERE option_name REGEXP %s 
+                 ORDER BY notice_id",
+                strlen( $option_prefix ) + 2,
+                '^' . preg_quote( $option_prefix ) . '_[0-9]+$'
+            )
+        );
+        
+        // Find first gap or return next sequential ID
         for ( $i = 1; $i <= self::MAX_NOTICES; $i++ ) {
-            if ( get_option( self::OPTION_PREFIX . '_' . $i ) === false ) {
+            if ( ! in_array( $i, $used_ids, true ) ) {
+                // Cache the result for 1 minute
+                wp_cache_set( $cache_key, $i, 'cli_notices', 60 );
                 return $i;
             }
         }
         
         return false; // No available slots
+    }
+    
+    /**
+     * Optimized batch loading of indexed notices using single database query
+     * Reduces 30 queries (3 per notice × 10 max notices) to 1 query
+     *
+     * @return array Associative array of notices indexed by ID
+     */
+    private static function get_indexed_notices_optimized() {
+        // Check object cache first
+        $cache_key = 'cli_dashboard_notices_indexed_v1';
+        $cached_notices = wp_cache_get( $cache_key, 'cli_notices' );
+        
+        if ( false !== $cached_notices ) {
+            return $cached_notices;
+        }
+        
+        global $wpdb;
+        $option_prefix = self::OPTION_PREFIX;
+        
+        // Single query to get all notice-related options
+        $results = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT option_name, option_value 
+                 FROM {$wpdb->options} 
+                 WHERE option_name LIKE %s 
+                 AND option_name REGEXP %s
+                 ORDER BY option_name",
+                $option_prefix . '_%',
+                '^' . preg_quote( $option_prefix ) . '_[0-9]+(_type|_expires)?$'
+            ),
+            ARRAY_A
+        );
+        
+        // Parse results into structured notice array
+        $notices = self::parse_indexed_notice_results( $results );
+        
+        // Cache for 5 minutes
+        wp_cache_set( $cache_key, $notices, 'cli_notices', 300 );
+        
+        return $notices;
+    }
+    
+    /**
+     * Parse batch query results into notice structures
+     *
+     * @param array $results Database query results
+     * @return array Parsed notices indexed by ID
+     */
+    private static function parse_indexed_notice_results( $results ) {
+        $notices = [];
+        $raw_data = [];
+        
+        // Group options by notice ID
+        foreach ( $results as $row ) {
+            $option_name = $row['option_name'];
+            $option_value = $row['option_value'];
+            
+            // Extract notice ID and field type using regex
+            if ( preg_match( '/^' . preg_quote( self::OPTION_PREFIX ) . '_(\d+)(?:_(.+))?$/', $option_name, $matches ) ) {
+                $notice_id = (int) $matches[1];
+                $field = isset( $matches[2] ) ? $matches[2] : 'message';
+                
+                $raw_data[$notice_id][$field] = $option_value;
+            }
+        }
+        
+        // Convert to standardized notice format
+        foreach ( $raw_data as $id => $data ) {
+            if ( ! empty( $data['message'] ) ) {
+                $notices[$id] = [
+                    'id' => $id,
+                    'message' => $data['message'],
+                    'type' => $data['type'] ?? 'warning',
+                    'expires' => $data['expires'] ?? null
+                ];
+            }
+        }
+        
+        return $notices;
+    }
+    
+    /**
+     * Get legacy single notice with caching
+     *
+     * @return array|false Legacy notice data or false if not found
+     */
+    private static function get_legacy_notice_cached() {
+        $cache_key = 'cli_dashboard_notices_legacy';
+        $cached_legacy = wp_cache_get( $cache_key, 'cli_notices' );
+        
+        // Check if we have a cached result (including negative results)
+        if ( false !== $cached_legacy ) {
+            // Return false if we cached that no notice exists
+            if ( $cached_legacy === 'NO_NOTICE' ) {
+                return false;
+            }
+            return $cached_legacy;
+        }
+        
+        $legacy_message = get_option( self::OPTION_PREFIX );
+        if ( $legacy_message === false ) {
+            // Cache negative result with sentinel value to avoid repeated queries
+            wp_cache_set( $cache_key, 'NO_NOTICE', 'cli_notices', 300 );
+            return false;
+        }
+        
+        $legacy_notice = [
+            'id' => 0,
+            'message' => $legacy_message,
+            'type' => get_option( self::OPTION_PREFIX . '_type', 'warning' ),
+            'expires' => get_option( self::OPTION_PREFIX . '_expires' )
+        ];
+        
+        wp_cache_set( $cache_key, $legacy_notice, 'cli_notices', 300 );
+        return $legacy_notice;
+    }
+    
+    /**
+     * Invalidate notice cache when notices are modified
+     */
+    public static function invalidate_notice_cache() {
+        wp_cache_delete( 'cli_dashboard_notices_indexed_v1', 'cli_notices' );
+        wp_cache_delete( 'cli_dashboard_notices_legacy', 'cli_notices' );
+        wp_cache_delete( 'cli_dashboard_notices_next_id', 'cli_notices' );
+        
+        // Clear any transients that might be caching notice data
+        delete_transient( 'cli_notices_status' );
+        
+        // Clear object cache group if function exists (some cache systems support this)
+        if ( function_exists( 'wp_cache_flush_group' ) ) {
+            wp_cache_flush_group( 'cli_notices' );
+        }
+        
+        // Clear internal static cache
+        self::$cached_options = null;
     }
     
     /**
@@ -141,6 +290,8 @@ class CLI_Dashboard_Notice {
         $current_next = get_option( self::INDEX_OPTION, 1 );
         if ( $used_id >= $current_next ) {
             update_option( self::INDEX_OPTION, $used_id + 1 );
+            // Invalidate next ID cache since available IDs have changed
+            wp_cache_delete( 'cli_dashboard_notices_next_id', 'cli_notices' );
         }
     }
     
@@ -187,10 +338,30 @@ class CLI_Dashboard_Notice {
                 var noticeId = \$notice.data('notice-id');
                 if (!nonce || noticeId === undefined) return;
                 
+                // Add loading state
+                \$notice.css('opacity', '0.5');
+                
                 $.post(ajaxurl, {
                     action: 'cli_notice_dismiss',
                     nonce: nonce,
                     notice_id: noticeId
+                })
+                .done(function(response) {
+                    if (response.success) {
+                        // Hide notice immediately on success
+                        \$notice.fadeOut(300, function() {
+                            \$notice.remove();
+                        });
+                    } else {
+                        // Restore opacity on error
+                        \$notice.css('opacity', '1');
+                        console.error('Notice dismissal failed:', response.data);
+                    }
+                })
+                .fail(function() {
+                    // Restore opacity on network error
+                    \$notice.css('opacity', '1');
+                    console.error('Notice dismissal failed: Network error');
                 });
             });
         });";
@@ -348,6 +519,9 @@ class CLI_Dashboard_Notice {
      * @param int $notice_id Notice ID to clean up (0 for legacy notice)
      */
     public static function cleanup_notice_by_id( $notice_id ) {
+        // Invalidate cache BEFORE deletion to prevent race conditions
+        self::invalidate_notice_cache();
+        
         if ( $notice_id === 0 ) {
             // Legacy single notice
             $options = [
@@ -364,17 +538,22 @@ class CLI_Dashboard_Notice {
             ];
         }
         
+        $deleted_count = 0;
         foreach ( $options as $option ) {
-            delete_option( $option );
+            if ( delete_option( $option ) ) {
+                $deleted_count++;
+            }
         }
         
-        // Clear cache after cleanup
-        self::clear_option_cache();
+        // Invalidate cache AGAIN after deletion to ensure clean state
+        self::invalidate_notice_cache();
         
         // Optional logging - disabled by default, enable via filter
         if ( apply_filters( 'cli_dashboard_notice_enable_logging', false ) && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
-            error_log( sprintf( __( 'CLI Dashboard Notice: Notice ID %d cleaned up', 'cli-dashboard-notice' ), $notice_id ) );
+            error_log( sprintf( __( 'CLI Dashboard Notice: Notice ID %d cleaned up (deleted %d options)', 'cli-dashboard-notice' ), $notice_id, $deleted_count ) );
         }
+        
+        return $deleted_count;
     }
     
     /**
@@ -811,6 +990,9 @@ class CLI_Notice_Command {
         // Update next ID counter
         CLI_Dashboard_Notice::update_next_id( $notice_id );
         
+        // Invalidate cache after successful database operations
+        CLI_Dashboard_Notice::invalidate_notice_cache();
+        
         WP_CLI::success( sprintf( __( 'Notice added successfully. ID: %d, Type: %s', 'cli-dashboard-notice' ), $notice_id, $type ) );
         
         // CLI audit logging
@@ -898,6 +1080,9 @@ class CLI_Notice_Command {
         } elseif ( $clear_expiry ) {
             delete_option( $expires_key );
         }
+        
+        // Invalidate cache after successful database operations
+        CLI_Dashboard_Notice::invalidate_notice_cache();
         
         WP_CLI::success( sprintf( __( 'Notice updated successfully. ID: %s, Type: %s', 'cli-dashboard-notice' ), $notice_id === 0 ? 'legacy' : $notice_id, $type ) );
         
@@ -998,6 +1183,9 @@ class CLI_Notice_Command {
         if ( $deleted_count === 0 ) {
             WP_CLI::warning( __( 'No notice options found to delete.', 'cli-dashboard-notice' ) );
         } else {
+            // Invalidate cache after successful deletion operations
+            CLI_Dashboard_Notice::invalidate_notice_cache();
+            
             WP_CLI::success( sprintf( __( 'Notice deletion complete. Removed %d notice(s).', 'cli-dashboard-notice' ), $deleted_count ) );
             
             // CLI audit logging
