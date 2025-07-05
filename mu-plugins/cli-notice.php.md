@@ -1,6 +1,6 @@
-# CLI Dashboard Notice README (v2.2.1)
+# CLI Dashboard Notice README (v2.3.0)
 
-This document provides instructions for installing, configuring, and using the **CLI Dashboard Notice** Must-Use plugin for WordPress. This tool enables you to manage **multiple dashboard notices** simultaneously via WP‑CLI commands, with enhanced security, controlled CLI bypass for bulk operations, and comprehensive audit logging.
+This document provides instructions for installing, configuring, and using the **CLI Dashboard Notice** Must-Use plugin for WordPress. This tool enables you to manage **multiple dashboard notices** simultaneously via WP‑CLI commands, with enhanced security, server key authentication, atomic cache operations, and comprehensive audit logging.
 
 ![screenshot](screenshots/wp-plugin-cli-notice.png)
 
@@ -10,10 +10,12 @@ This document provides instructions for installing, configuring, and using the *
 
 * [Prerequisites](#prerequisites)
 * [Installation](#installation)
+* [What's New in v2.3.0](#whats-new-in-v230)
 * [What's New in v2.2.1](#whats-new-in-v221)
 * [What's New in v2.2.0](#whats-new-in-v220)
 * [Performance Optimization](#performance-optimization)
 * [Security Model](#security-model)
+* [Server Key Authentication](#server-key-authentication)
 * [CLI Bypass Features](#cli-bypass-features)
 * [Usage](#usage)
 * [Bulk Operations](#bulk-operations)
@@ -65,6 +67,40 @@ chmod 644 wp-content/mu-plugins/cli-notice.php
    ```
 
 That's it! The plugin is active automatically and ready for secure use.
+
+---
+
+## What's New in v2.3.0
+
+### 🔐 **Critical Security Enhancements**
+* **Server Key Authentication** - Secure authentication system for server administrators
+* **Tiered Authentication Model** - Four-tier authentication system with WordPress user, server key, limited read bypass, and explicit bypass methods
+* **Hardened Security Status** - Removed information disclosure vulnerabilities from security configuration display
+* **Enhanced Audit Logging** - Comprehensive authentication tier tracking and security event logging
+
+### 🛡️ **Atomic Cache Operations** 
+* **Race Condition Fixes** - Fixed critical cache invalidation race conditions with distributed locking
+* **Atomic Operations** - All cache operations now use atomic locking with retry logic and exponential backoff
+* **Data Integrity** - Eliminated dual cache invalidation pattern that caused race conditions
+* **Multi-Server Support** - Distributed locking works across multiple server environments
+
+### 🔑 **Server Key Management**
+* **Key Generation** - `wp notice generate_key --confirm` command for secure key generation
+* **Key Status Checking** - `wp notice key_status` command to verify server key configuration
+* **Key Removal** - `wp notice remove_key --confirm` command for key management
+* **Secure Storage** - Keys stored as SHA-256 hashes with temporary file delivery for admins
+
+### 🎯 **Enhanced CLI Commands**
+* **Improved Error Handling** - Better error messages for cache operation failures
+* **Authentication Feedback** - Clear indication of which authentication tier was used
+* **Backward Compatibility** - All existing commands and flags continue to work
+* **Enhanced Security Logging** - More detailed audit trails for all operations
+
+### 📊 **Security Improvements**
+* **Authentication Bypass Eliminated** - No more blanket bypass for read operations like `security_status`
+* **Information Disclosure Fixed** - Security status no longer reveals sensitive configuration details
+* **Server Admin Use Case** - Designed specifically for server administrators managing multiple WordPress instances
+* **Comprehensive Audit Trail** - Enhanced logging with authentication context and security tier information
 
 ---
 
@@ -235,34 +271,301 @@ add_filter('cli_notice_cache_ttl', function($ttl) {
 
 ## Security Model
 
-### Dual Security Architecture
+### Tiered Authentication Architecture (v2.3.0+)
 
 ```
-┌─────────────────────┬─────────────────────┬─────────────────────┐
-│   Operation Type    │    Web Context      │    CLI Context      │
-├─────────────────────┼─────────────────────┼─────────────────────┤
-│ AJAX Notice Dismiss │ STRICT SECURITY     │ N/A                 │
-│                     │ - Nonce required    │                     │
-│                     │ - manage_options    │                     │
-├─────────────────────┼─────────────────────┼─────────────────────┤
-│ Read Operations     │ STRICT SECURITY     │ AUTOMATIC ALLOW     │
-│ (status, list)      │ - manage_options    │ - Always permitted  │
-│                     │                     │ - Logged            │
-├─────────────────────┼─────────────────────┼─────────────────────┤
-│ Write Operations    │ STRICT SECURITY     │ CONTROLLED BYPASS   │
-│ (add, update, del)  │ - manage_options    │ - Requires flag     │
-│                     │                     │ - Or env variable   │
-│                     │                     │ - Fully logged      │
-└─────────────────────┴─────────────────────┴─────────────────────┘
+┌─────────────────────┬─────────────────────┬─────────────────────────────────┐
+│   Operation Type    │    Web Context      │           CLI Context           │
+├─────────────────────┼─────────────────────┼─────────────────────────────────┤
+│ AJAX Notice Dismiss │ STRICT SECURITY     │ N/A                             │
+│                     │ - Nonce required    │                                 │
+│                     │ - manage_options    │                                 │
+├─────────────────────┼─────────────────────┼─────────────────────────────────┤
+│ Security Status     │ STRICT SECURITY     │ REQUIRES AUTHENTICATION         │
+│                     │ - manage_options    │ - Tier 1: WordPress User        │
+│                     │                     │ - Tier 2: Server Key            │
+│                     │                     │ - Tier 4: Explicit Bypass       │
+├─────────────────────┼─────────────────────┼─────────────────────────────────┤
+│ Read Operations     │ STRICT SECURITY     │ TIERED AUTHENTICATION           │
+│ (status, list)      │ - manage_options    │ - Tier 1: WordPress User        │
+│                     │                     │ - Tier 2: Server Key            │
+│                     │                     │ - Tier 3: Limited Read Bypass   │
+│                     │                     │ - Tier 4: Explicit Bypass       │
+├─────────────────────┼─────────────────────┼─────────────────────────────────┤
+│ Write Operations    │ STRICT SECURITY     │ CONTROLLED AUTHENTICATION       │
+│ (add, update, del)  │ - manage_options    │ - Tier 1: WordPress User        │
+│                     │                     │ - Tier 2: Server Key            │
+│                     │                     │ - Tier 4: Explicit Bypass       │
+└─────────────────────┴─────────────────────┴─────────────────────────────────┘
 ```
+
+### Authentication Tiers (CLI Context)
+
+**Tier 1: WordPress User Context** (Preferred)
+- User logged in with `manage_options` capability
+- Highest security level with full WordPress integration
+
+**Tier 2: Server Key Authentication** (Server Admin Use Case)
+- SHA-256 server key validation via environment variable
+- Designed for server administrators managing multiple WordPress instances
+- Includes IP and time restrictions
+
+**Tier 3: Limited Read Bypass** (Minimal Scope)
+- Only `status` and `list` operations
+- No authentication required for basic status checks
+- Comprehensive audit logging
+
+**Tier 4: Explicit Bypass** (Backward Compatibility)
+- Requires `--allow-cli` flag or environment variables
+- Full audit logging with security implications noted
+- Maintained for existing workflows
 
 ### Security Layers
 
 1. **Context Detection**: Automatically detects web vs CLI environment
-2. **Operation Classification**: Different rules for read vs write operations
-3. **Explicit Bypass**: Intentional flags required for CLI write operations
-4. **Comprehensive Logging**: Every CLI operation logged with full context
-5. **Optional Restrictions**: IP whitelisting, time controls, business hours
+2. **Tiered Authentication**: Four authentication tiers with escalating security
+3. **Server Key Management**: Secure SHA-256 key-based authentication for server admins
+4. **Atomic Operations**: Race condition prevention with distributed locking
+5. **Comprehensive Logging**: Every operation logged with authentication tier context
+6. **Optional Restrictions**: IP whitelisting, time controls, business hours
+
+---
+
+## Server Key Authentication
+
+### Overview
+
+Server Key Authentication (v2.3.0+) provides a secure method for server administrators to authenticate CLI operations without requiring WordPress user credentials. This is specifically designed for the server admin use case where you manage multiple WordPress instances that you own and operate.
+
+### Key Features
+
+- **SHA-256 Security**: Keys are stored as secure hashes, never in plain text
+- **Environment Variable Delivery**: Keys provided via secure environment variables
+- **IP and Time Restrictions**: Supports all existing security controls
+- **Comprehensive Audit Logging**: All operations tracked with server key context
+- **Temporary File Delivery**: Secure key delivery to server administrators
+
+### Setup Process
+
+#### 1. Generate Server Key
+
+```bash
+# Generate a new server key (requires WordPress admin access initially)
+wp notice generate_key --confirm
+```
+
+**Sample Output:**
+```
+Success: Server key generated successfully!
+
+To use the server key for CLI authentication, run:
+
+export CLI_NOTICE_SERVER_KEY="A1B2C3D4E5F6...64_character_key_here"
+
+Then use wp notice commands normally without --allow-cli flag.
+
+IMPORTANT: Save this key securely - it cannot be recovered!
+Key also saved to temporary file: /tmp/cli_notice_server_key_1234567890.txt
+```
+
+#### 2. Configure Environment
+
+```bash
+# Set the server key in your environment
+export CLI_NOTICE_SERVER_KEY="your_generated_64_character_key_here"
+
+# Optional: Add to your shell profile for persistence
+echo 'export CLI_NOTICE_SERVER_KEY="your_key_here"' >> ~/.bashrc
+```
+
+#### 3. Use CLI Commands
+
+```bash
+# Commands now work without --allow-cli flag
+wp notice add "Maintenance scheduled" --type=warning
+wp notice status
+wp notice update "Maintenance completed" --type=success
+wp notice delete
+```
+
+### Key Management Commands
+
+#### Check Server Key Status
+
+```bash
+wp notice key_status
+```
+
+**Sample Output:**
+```
+Success: Server key is configured.
+✓ Current environment has valid server key
+```
+
+#### Remove Server Key
+
+```bash
+# Remove the server key (requires confirmation)
+wp notice remove_key --confirm
+```
+
+**Sample Output:**
+```
+Success: Server key removed successfully.
+Warning: CLI operations will now require --allow-cli flag or WordPress user context.
+```
+
+### Security Considerations
+
+#### Key Storage
+- **Database**: Only SHA-256 hash stored in WordPress options
+- **Environment**: Plain text key in environment variable (secure server access required)
+- **Temporary Files**: Keys written to `/tmp` with 600 permissions, auto-removed
+
+#### Access Control
+- **Server Access Required**: Environment variable requires server-level access
+- **IP Restrictions**: Server key authentication respects IP whitelisting
+- **Time Controls**: Business hours restrictions apply to server key operations
+- **Audit Logging**: All operations logged with "server_key" authentication tier
+
+#### Best Practices
+
+```bash
+# Secure key storage
+export CLI_NOTICE_SERVER_KEY="$(cat /secure/path/to/keyfile)"
+
+# IP-restricted server key usage
+export CLI_NOTICE_ALLOWED_IPS="192.168.1.100"
+export CLI_NOTICE_SERVER_KEY="your_key_here"
+
+# Business hours restrictions
+export CLI_NOTICE_BUSINESS_HOURS_ONLY=1
+export CLI_NOTICE_SERVER_KEY="your_key_here"
+```
+
+### Bulk Server Management
+
+#### Multi-Site Key Setup
+
+```bash
+#!/bin/bash
+# setup-server-keys.sh - Generate keys for multiple WordPress sites
+
+SITES_FILE="sites.txt"
+KEYS_DIR="/secure/cli-notice-keys"
+
+mkdir -p "$KEYS_DIR"
+chmod 700 "$KEYS_DIR"
+
+while IFS= read -r site_path; do
+    [[ -z "$site_path" || "$site_path" =~ ^[[:space:]]*# ]] && continue
+    
+    echo "Setting up server key for: $site_path"
+    cd "$site_path"
+    
+    if wp core is-installed 2>/dev/null; then
+        # Generate key with WordPress admin user context
+        KEY=$(wp notice generate_key --confirm --user=admin 2>/dev/null | grep "CLI_NOTICE_SERVER_KEY=" | cut -d'"' -f2)
+        
+        if [ -n "$KEY" ]; then
+            # Save key securely
+            SITE_NAME=$(basename "$(dirname "$site_path")")
+            echo "$KEY" > "$KEYS_DIR/${SITE_NAME}.key"
+            chmod 600 "$KEYS_DIR/${SITE_NAME}.key"
+            echo "✅ Key saved: $KEYS_DIR/${SITE_NAME}.key"
+        else
+            echo "❌ Failed to generate key for: $site_path"
+        fi
+    else
+        echo "❌ Invalid WordPress: $site_path"
+    fi
+done < "$SITES_FILE"
+
+echo "Server key setup complete. Keys stored in: $KEYS_DIR"
+```
+
+#### Automated Operations with Server Keys
+
+```bash
+#!/bin/bash
+# server-key-operations.sh - Use server keys for automated operations
+
+KEYS_DIR="/secure/cli-notice-keys"
+OPERATION="$1"
+MESSAGE="$2"
+
+process_sites_with_keys() {
+    local operation="$1"
+    local message="$2"
+    
+    for key_file in "$KEYS_DIR"/*.key; do
+        [ ! -f "$key_file" ] && continue
+        
+        SITE_NAME=$(basename "$key_file" .key)
+        SITE_PATH="/home/nginx/domains/${SITE_NAME}/public"
+        SERVER_KEY=$(cat "$key_file")
+        
+        if [ -d "$SITE_PATH" ]; then
+            echo "Processing: $SITE_NAME"
+            cd "$SITE_PATH"
+            
+            # Set server key for this operation
+            export CLI_NOTICE_SERVER_KEY="$SERVER_KEY"
+            
+            case "$operation" in
+                "add")
+                    wp notice add "$message" --type=warning
+                    ;;
+                "status")
+                    wp notice status
+                    ;;
+                "delete")
+                    wp notice delete
+                    ;;
+            esac
+            
+            # Clear the key from environment
+            unset CLI_NOTICE_SERVER_KEY
+        fi
+    done
+}
+
+case "$OPERATION" in
+    "add"|"status"|"delete")
+        process_sites_with_keys "$OPERATION" "$MESSAGE"
+        ;;
+    *)
+        echo "Usage: $0 {add|status|delete} [message]"
+        echo "Example: $0 add 'Maintenance scheduled tonight'"
+        exit 1
+        ;;
+esac
+```
+
+### Migration from CLI Bypass
+
+#### Gradual Migration Strategy
+
+```bash
+#!/bin/bash
+# migrate-to-server-keys.sh - Migrate from CLI bypass to server keys
+
+# Phase 1: Generate server keys while keeping CLI bypass
+export CLI_NOTICE_ENABLE=1  # Keep existing method working
+
+# Generate keys for all sites
+./setup-server-keys.sh
+
+# Phase 2: Test server key operations
+export CLI_NOTICE_ENABLE=0  # Disable CLI bypass
+# Test with server keys...
+
+# Phase 3: Update scripts to use server keys
+# Update all automation scripts to use server key files
+
+# Phase 4: Remove CLI bypass configuration
+# Remove CLI_NOTICE_ENABLE from environment and wp-config.php
+```
 
 ---
 
@@ -453,13 +756,33 @@ ID 5: [error] Critical security issue
 ### New Commands
 
 #### `wp notice security_status`
-Display current security configuration and settings.
+Display current security configuration and settings. **Note:** This command now requires authentication (v2.3.0+) and provides sanitized security information.
 
 ```bash
 wp notice security_status
 ```
 
-**Sample Output:**
+**Sample Output (v2.3.0+):**
+```
+CLI Dashboard Notice Security Configuration:
+
+CLI Bypass Enabled: Yes
+Server Key Configured: Yes
+IP Restrictions Active: Yes
+Business Hours Only: No
+Audit Logging Active: Yes
+
+Current Authentication:
+Authentication Tier: Server Key
+WordPress User: No user context
+
+Security Recommendations:
+⚠️ CLI bypass enabled - Review security settings
+✅ Server key authentication available
+💡 Consider enabling business hours restrictions
+```
+
+**Legacy Output (v2.2.1 and earlier):**
 ```
 CLI Dashboard Notice Security Configuration:
 
@@ -481,6 +804,8 @@ Security Recommendations:
 ⚠️ CLI bypass enabled - Review security settings
 💡 Consider enabling business hours restrictions
 ```
+
+**Security Note:** In v2.3.0+, sensitive information like actual IP addresses, file paths, and system details are no longer displayed to prevent information disclosure. The new format focuses on security status indicators rather than configuration details.
 
 #### `wp notice enable-cli`
 Get instructions for enabling CLI bypass temporarily.
@@ -1201,6 +1526,7 @@ add_action('cli_dashboard_notice_audit_log', function($message, $audit_data) {
 
 ### Version History
 
+* **v2.3.0**: Critical security enhancements with server key authentication, tiered authentication model, atomic cache operations, and hardened security status
 * **v2.2.1**: Critical bug fixes for cache invalidation, notice deletion, and dashboard dismissal
 * **v2.2.0**: Multiple notice support with auto-ID assignment and enhanced performance
 * **v2.1.1**: CLI bypass functionality with enhanced security controls

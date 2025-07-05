@@ -6,7 +6,8 @@
  *   - Support for up to 10 concurrent notices with auto-ID assignment
  *   - Individual expiration, types, and dismissal for each notice
  *   - Backward compatible with existing single-notice installations
- * Version: 2.2.1
+ *   - Server key authentication and atomic cache operations
+ * Version: 2.3.0
  * Author: CLI
  * Author URI: https://centminmod.com
  * License: GPLv2 or later
@@ -31,6 +32,11 @@ class CLI_Dashboard_Notice {
     const MIN_TIME_DISPLAY_THRESHOLD = 300;
     const MAX_NOTICES = 10;
     
+    // Server key authentication constants
+    const SERVER_KEY_OPTION = 'cli_notice_server_key_hash';
+    const SERVER_KEY_LENGTH = 64;
+    const SERVER_KEY_ENV_VAR = 'CLI_NOTICE_SERVER_KEY';
+    
     /**
      * Cached options to prevent multiple database calls
      */
@@ -54,6 +60,71 @@ class CLI_Dashboard_Notice {
         
         // Enqueue admin script for dismissal functionality
         add_action( 'admin_enqueue_scripts', [ __CLASS__, 'enqueue_admin_scripts' ] );
+    }
+    
+    /**
+     * Generate a new server key for CLI authentication
+     *
+     * @return string The generated server key (plain text)
+     */
+    public static function generate_server_key() {
+        $server_key = wp_generate_password( self::SERVER_KEY_LENGTH, false );
+        $key_hash = hash( 'sha256', $server_key );
+        
+        // Store the hash in WordPress options
+        update_option( self::SERVER_KEY_OPTION, $key_hash );
+        
+        // Log the generation event
+        self::cli_audit_log( 'Server key generated', [
+            'key_hash_prefix' => substr( $key_hash, 0, 8 ) . '...',
+            'generation_time' => current_time( 'mysql' ),
+            'user_id' => get_current_user_id() ?: 'cli-no-user'
+        ] );
+        
+        return $server_key;
+    }
+    
+    /**
+     * Validate server key from environment variable
+     *
+     * @return bool True if valid server key provided
+     */
+    public static function validate_server_key() {
+        $provided_key = getenv( self::SERVER_KEY_ENV_VAR );
+        if ( empty( $provided_key ) ) {
+            return false;
+        }
+        
+        $stored_hash = get_option( self::SERVER_KEY_OPTION );
+        if ( empty( $stored_hash ) ) {
+            return false;
+        }
+        
+        $provided_hash = hash( 'sha256', $provided_key );
+        $is_valid = hash_equals( $stored_hash, $provided_hash );
+        
+        if ( $is_valid ) {
+            self::cli_audit_log( 'Server key authentication successful', [
+                'key_hash_prefix' => substr( $stored_hash, 0, 8 ) . '...',
+                'auth_time' => current_time( 'mysql' )
+            ] );
+        } else {
+            self::cli_audit_log( 'Server key authentication failed', [
+                'provided_hash_prefix' => substr( $provided_hash, 0, 8 ) . '...',
+                'auth_time' => current_time( 'mysql' )
+            ] );
+        }
+        
+        return $is_valid;
+    }
+    
+    /**
+     * Check if server key is configured
+     *
+     * @return bool True if server key is set up
+     */
+    public static function has_server_key() {
+        return ! empty( get_option( self::SERVER_KEY_OPTION ) );
     }
     
     /**
@@ -262,23 +333,85 @@ class CLI_Dashboard_Notice {
     }
     
     /**
-     * Invalidate notice cache when notices are modified
+     * Invalidate notice cache when notices are modified (atomic operation)
      */
     public static function invalidate_notice_cache() {
-        wp_cache_delete( 'cli_dashboard_notices_indexed_v1', 'cli_notices' );
-        wp_cache_delete( 'cli_dashboard_notices_legacy', 'cli_notices' );
-        wp_cache_delete( 'cli_dashboard_notices_next_id', 'cli_notices' );
+        return self::atomic_cache_operation( function() {
+            wp_cache_delete( 'cli_dashboard_notices_indexed_v1', 'cli_notices' );
+            wp_cache_delete( 'cli_dashboard_notices_legacy', 'cli_notices' );
+            wp_cache_delete( 'cli_dashboard_notices_next_id', 'cli_notices' );
+            
+            // Clear any transients that might be caching notice data
+            delete_transient( 'cli_notices_status' );
+            
+            // Clear object cache group if function exists (some cache systems support this)
+            if ( function_exists( 'wp_cache_flush_group' ) ) {
+                wp_cache_flush_group( 'cli_notices' );
+            }
+            
+            // Clear internal static cache
+            self::$cached_options = null;
+            
+            return true;
+        } );
+    }
+    
+    /**
+     * Perform atomic cache operation with distributed locking
+     *
+     * @param callable $callback The operation to perform atomically
+     * @param string $lock_id Optional lock identifier
+     * @return mixed Result of callback or WP_Error on lock failure
+     */
+    public static function atomic_cache_operation( callable $callback, $lock_id = 'default' ) {
+        $lock_key = "cli_notice_cache_lock_{$lock_id}";
+        $lock_ttl = 5; // seconds
+        $max_retries = 3;
+        $retry_delay = 100000; // microseconds (0.1 seconds)
         
-        // Clear any transients that might be caching notice data
-        delete_transient( 'cli_notices_status' );
-        
-        // Clear object cache group if function exists (some cache systems support this)
-        if ( function_exists( 'wp_cache_flush_group' ) ) {
-            wp_cache_flush_group( 'cli_notices' );
+        for ( $retry = 0; $retry < $max_retries; $retry++ ) {
+            // Try to acquire lock
+            if ( wp_cache_add( $lock_key, time(), 'cli_notices_locks', $lock_ttl ) ) {
+                try {
+                    // Execute the callback within the lock
+                    $result = call_user_func( $callback );
+                    
+                    // Log successful atomic operation
+                    self::cli_audit_log( 'Atomic cache operation completed', [
+                        'lock_id' => $lock_id,
+                        'retry_attempt' => $retry + 1
+                    ] );
+                    
+                    return $result;
+                } catch ( Exception $e ) {
+                    // Log error but still release lock
+                    self::cli_audit_log( 'Atomic cache operation failed', [
+                        'lock_id' => $lock_id,
+                        'error' => $e->getMessage(),
+                        'retry_attempt' => $retry + 1
+                    ] );
+                    throw $e;
+                } finally {
+                    // Always release the lock
+                    wp_cache_delete( $lock_key, 'cli_notices_locks' );
+                }
+            }
+            
+            // Lock acquisition failed, wait before retry
+            if ( $retry < $max_retries - 1 ) {
+                usleep( $retry_delay * ( $retry + 1 ) ); // Exponential backoff
+            }
         }
         
-        // Clear internal static cache
-        self::$cached_options = null;
+        // All retries failed
+        self::cli_audit_log( 'Atomic cache operation lock acquisition failed', [
+            'lock_id' => $lock_id,
+            'max_retries' => $max_retries
+        ] );
+        
+        return new WP_Error( 'cache_lock_failed', 
+            sprintf( __( 'Cache operation in progress. Please retry in a few seconds.', 'cli-dashboard-notice' ) )
+        );
     }
     
     /**
@@ -514,46 +647,43 @@ class CLI_Dashboard_Notice {
     }
     
     /**
-     * Clean up specific notice by ID
+     * Clean up specific notice by ID (atomic operation)
      *
      * @param int $notice_id Notice ID to clean up (0 for legacy notice)
      */
     public static function cleanup_notice_by_id( $notice_id ) {
-        // Invalidate cache BEFORE deletion to prevent race conditions
-        self::invalidate_notice_cache();
-        
-        if ( $notice_id === 0 ) {
-            // Legacy single notice
-            $options = [
-                self::OPTION_PREFIX,
-                self::OPTION_PREFIX . '_type',
-                self::OPTION_PREFIX . '_expires',
-            ];
-        } else {
-            // Indexed notice
-            $options = [
-                self::OPTION_PREFIX . '_' . $notice_id,
-                self::OPTION_PREFIX . '_' . $notice_id . '_type',
-                self::OPTION_PREFIX . '_' . $notice_id . '_expires',
-            ];
-        }
-        
-        $deleted_count = 0;
-        foreach ( $options as $option ) {
-            if ( delete_option( $option ) ) {
-                $deleted_count++;
+        // Perform deletion as atomic operation to prevent race conditions
+        return self::atomic_cache_operation( function() use ( $notice_id ) {
+            if ( $notice_id === 0 ) {
+                // Legacy single notice
+                $options = [
+                    self::OPTION_PREFIX,
+                    self::OPTION_PREFIX . '_type',
+                    self::OPTION_PREFIX . '_expires',
+                ];
+            } else {
+                // Indexed notice
+                $options = [
+                    self::OPTION_PREFIX . '_' . $notice_id,
+                    self::OPTION_PREFIX . '_' . $notice_id . '_type',
+                    self::OPTION_PREFIX . '_' . $notice_id . '_expires',
+                ];
             }
-        }
-        
-        // Invalidate cache AGAIN after deletion to ensure clean state
-        self::invalidate_notice_cache();
-        
-        // Optional logging - disabled by default, enable via filter
-        if ( apply_filters( 'cli_dashboard_notice_enable_logging', false ) && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
-            error_log( sprintf( __( 'CLI Dashboard Notice: Notice ID %d cleaned up (deleted %d options)', 'cli-dashboard-notice' ), $notice_id, $deleted_count ) );
-        }
-        
-        return $deleted_count;
+            
+            $deleted_count = 0;
+            foreach ( $options as $option ) {
+                if ( delete_option( $option ) ) {
+                    $deleted_count++;
+                }
+            }
+            
+            // Optional logging - disabled by default, enable via filter
+            if ( apply_filters( 'cli_dashboard_notice_enable_logging', false ) && defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
+                error_log( sprintf( __( 'CLI Dashboard Notice: Notice ID %d cleaned up (deleted %d options)', 'cli-dashboard-notice' ), $notice_id, $deleted_count ) );
+            }
+            
+            return $deleted_count;
+        }, "cleanup_{$notice_id}" );
     }
     
     /**
@@ -860,7 +990,7 @@ class CLI_Notice_Command {
     }
     
     /**
-     * Check user permissions with enhanced CLI handling
+     * Check user permissions with tiered authentication system
      *
      * @param string $operation Operation being performed
      * @param array $assoc_args WP-CLI associated arguments
@@ -872,27 +1002,9 @@ class CLI_Notice_Command {
             return new WP_Error( 'no_wp_functions', __( 'WordPress functions not available.', 'cli-dashboard-notice' ) );
         }
         
-        // Handle CLI context with controlled bypass
+        // Handle CLI context with tiered authentication
         if ( defined( 'WP_CLI' ) && WP_CLI ) {
-            $current_user = wp_get_current_user();
-            
-            // For read operations in CLI, allow without user context
-            if ( in_array( $operation, [ 'status', 'list', 'security_status' ], true ) ) {
-                CLI_Dashboard_Notice::cli_audit_log( "CLI read operation allowed: {$operation}" );
-                return true;
-            }
-            
-            // For write operations, check if user context exists first
-            if ( $current_user->exists() && current_user_can( 'manage_options' ) ) {
-                CLI_Dashboard_Notice::cli_audit_log( "CLI operation with user context: {$operation}", [
-                    'user_id' => $current_user->ID,
-                    'user_login' => $current_user->user_login
-                ] );
-                return true;
-            }
-            
-            // No user context - check for CLI bypass
-            return $this->check_cli_bypass( $operation, $assoc_args );
+            return $this->authenticate_cli_operation( $operation, $assoc_args );
         }
         
         // Web context - always strict
@@ -904,6 +1016,61 @@ class CLI_Notice_Command {
         }
         
         return true;
+    }
+    
+    /**
+     * Tiered authentication for CLI operations
+     *
+     * @param string $operation Operation being performed
+     * @param array $assoc_args WP-CLI associated arguments
+     * @return true|WP_Error True if authorized, WP_Error otherwise
+     */
+    private function authenticate_cli_operation( $operation, $assoc_args = [] ) {
+        $current_user = wp_get_current_user();
+        
+        // Tier 1: WordPress user context (preferred method)
+        if ( $current_user->exists() && current_user_can( 'manage_options' ) ) {
+            CLI_Dashboard_Notice::cli_audit_log( "CLI operation with WordPress user context: {$operation}", [
+                'auth_tier' => 'wordpress_user',
+                'user_id' => $current_user->ID,
+                'user_login' => $current_user->user_login
+            ] );
+            return true;
+        }
+        
+        // Tier 2: Server key authentication (server admin use case)
+        if ( CLI_Dashboard_Notice::validate_server_key() ) {
+            // Check IP and time restrictions for server key auth
+            $ip_check = $this->check_ip_restrictions();
+            if ( is_wp_error( $ip_check ) ) {
+                return $ip_check;
+            }
+            
+            $time_check = $this->check_time_restrictions();
+            if ( is_wp_error( $time_check ) ) {
+                return $time_check;
+            }
+            
+            CLI_Dashboard_Notice::cli_audit_log( "CLI operation with server key authentication: {$operation}", [
+                'auth_tier' => 'server_key',
+                'operation' => $operation
+            ] );
+            return true;
+        }
+        
+        // Tier 3: Read operations with authentication bypass (limited scope)
+        // Note: security_status removed from this list - now requires authentication
+        if ( in_array( $operation, [ 'status', 'list' ], true ) ) {
+            CLI_Dashboard_Notice::cli_audit_log( "CLI read operation allowed without authentication: {$operation}", [
+                'auth_tier' => 'read_bypass',
+                'operation' => $operation,
+                'security_note' => 'Limited read-only operation in CLI context'
+            ] );
+            return true;
+        }
+        
+        // Tier 4: Explicit bypass with enhanced audit (fallback compatibility)
+        return $this->check_cli_bypass( $operation, $assoc_args );
     }
     
     /**
@@ -991,7 +1158,13 @@ class CLI_Notice_Command {
         CLI_Dashboard_Notice::update_next_id( $notice_id );
         
         // Invalidate cache after successful database operations
-        CLI_Dashboard_Notice::invalidate_notice_cache();
+        $cache_result = CLI_Dashboard_Notice::invalidate_notice_cache();
+        if ( is_wp_error( $cache_result ) ) {
+            WP_CLI::warning( sprintf( 
+                __( 'Notice added but cache invalidation failed: %s', 'cli-dashboard-notice' ), 
+                $cache_result->get_error_message() 
+            ) );
+        }
         
         WP_CLI::success( sprintf( __( 'Notice added successfully. ID: %d, Type: %s', 'cli-dashboard-notice' ), $notice_id, $type ) );
         
@@ -1082,7 +1255,13 @@ class CLI_Notice_Command {
         }
         
         // Invalidate cache after successful database operations
-        CLI_Dashboard_Notice::invalidate_notice_cache();
+        $cache_result = CLI_Dashboard_Notice::invalidate_notice_cache();
+        if ( is_wp_error( $cache_result ) ) {
+            WP_CLI::warning( sprintf( 
+                __( 'Notice updated but cache invalidation failed: %s', 'cli-dashboard-notice' ), 
+                $cache_result->get_error_message() 
+            ) );
+        }
         
         WP_CLI::success( sprintf( __( 'Notice updated successfully. ID: %s, Type: %s', 'cli-dashboard-notice' ), $notice_id === 0 ? 'legacy' : $notice_id, $type ) );
         
@@ -1159,9 +1338,17 @@ class CLI_Notice_Command {
             $all_notices = CLI_Dashboard_Notice::get_all_notices();
             
             foreach ( $all_notices as $id => $notice ) {
-                CLI_Dashboard_Notice::cleanup_notice_by_id( $id );
-                $deleted_count++;
-                WP_CLI::success( sprintf( __( 'Deleted notice ID %s.', 'cli-dashboard-notice' ), $id === 0 ? 'legacy' : $id ) );
+                $cleanup_result = CLI_Dashboard_Notice::cleanup_notice_by_id( $id );
+                if ( is_wp_error( $cleanup_result ) ) {
+                    WP_CLI::error( sprintf( 
+                        __( 'Failed to delete notice ID %s: %s', 'cli-dashboard-notice' ), 
+                        $id === 0 ? 'legacy' : $id, 
+                        $cleanup_result->get_error_message() 
+                    ) );
+                } else {
+                    $deleted_count++;
+                    WP_CLI::success( sprintf( __( 'Deleted notice ID %s.', 'cli-dashboard-notice' ), $id === 0 ? 'legacy' : $id ) );
+                }
             }
             
             // Clean up index counter
@@ -1175,16 +1362,30 @@ class CLI_Notice_Command {
                 WP_CLI::error( sprintf( __( 'Notice with ID %d does not exist.', 'cli-dashboard-notice' ), $notice_id ) );
             }
             
-            CLI_Dashboard_Notice::cleanup_notice_by_id( $notice_id );
-            $deleted_count = 1;
-            WP_CLI::success( sprintf( __( 'Deleted notice ID %s.', 'cli-dashboard-notice' ), $notice_id === 0 ? 'legacy' : $notice_id ) );
+            $cleanup_result = CLI_Dashboard_Notice::cleanup_notice_by_id( $notice_id );
+            if ( is_wp_error( $cleanup_result ) ) {
+                WP_CLI::error( sprintf( 
+                    __( 'Failed to delete notice ID %s: %s', 'cli-dashboard-notice' ), 
+                    $notice_id === 0 ? 'legacy' : $notice_id, 
+                    $cleanup_result->get_error_message() 
+                ) );
+            } else {
+                $deleted_count = 1;
+                WP_CLI::success( sprintf( __( 'Deleted notice ID %s.', 'cli-dashboard-notice' ), $notice_id === 0 ? 'legacy' : $notice_id ) );
+            }
         }
         
         if ( $deleted_count === 0 ) {
             WP_CLI::warning( __( 'No notice options found to delete.', 'cli-dashboard-notice' ) );
         } else {
             // Invalidate cache after successful deletion operations
-            CLI_Dashboard_Notice::invalidate_notice_cache();
+            $cache_result = CLI_Dashboard_Notice::invalidate_notice_cache();
+            if ( is_wp_error( $cache_result ) ) {
+                WP_CLI::warning( sprintf( 
+                    __( 'Notice deleted but cache invalidation failed: %s', 'cli-dashboard-notice' ), 
+                    $cache_result->get_error_message() 
+                ) );
+            }
             
             WP_CLI::success( sprintf( __( 'Notice deletion complete. Removed %d notice(s).', 'cli-dashboard-notice' ), $deleted_count ) );
             
@@ -1299,82 +1500,114 @@ class CLI_Notice_Command {
      * Show CLI bypass configuration and security status.
      */
     public function security_status() {
-        // This is always a read operation - use underscore method name for WP-CLI
+        // Require authentication for security status - no longer a bypass operation
         $permission_check = $this->check_permissions( 'security_status', [] );
         $this->handle_result( $permission_check );
+        
+        // Get sanitized security status
+        $status = $this->get_sanitized_security_status();
         
         WP_CLI::log( __( 'CLI Dashboard Notice Security Configuration:', 'cli-dashboard-notice' ) );
         WP_CLI::log( '' );
         
-        // Check environment variables
-        $env_enabled = getenv( 'CLI_NOTICE_ENABLE' ) === '1';
-        $allowed_ips = getenv( 'CLI_NOTICE_ALLOWED_IPS' );
-        $business_hours = getenv( 'CLI_NOTICE_BUSINESS_HOURS_ONLY' ) === '1';
+        WP_CLI::log( sprintf( __( 'CLI Bypass Enabled: %s', 'cli-dashboard-notice' ), $status['cli_enabled'] ? 'Yes' : 'No' ) );
+        WP_CLI::log( sprintf( __( 'Server Key Configured: %s', 'cli-dashboard-notice' ), $status['server_key_configured'] ? 'Yes' : 'No' ) );
+        WP_CLI::log( sprintf( __( 'IP Restrictions Active: %s', 'cli-dashboard-notice' ), $status['ip_restrictions_active'] ? 'Yes' : 'No' ) );
+        WP_CLI::log( sprintf( __( 'Business Hours Only: %s', 'cli-dashboard-notice' ), $status['business_hours_active'] ? 'Yes' : 'No' ) );
+        WP_CLI::log( sprintf( __( 'Audit Logging Active: %s', 'cli-dashboard-notice' ), $status['audit_logging_active'] ? 'Yes' : 'No' ) );
         
-        // Check constants
-        $const_enabled = defined( 'CLI_NOTICE_ENABLE' ) && CLI_NOTICE_ENABLE;
-        $const_ips = defined( 'CLI_NOTICE_ALLOWED_IPS' ) ? CLI_NOTICE_ALLOWED_IPS : null;
-        $const_business = defined( 'CLI_NOTICE_BUSINESS_HOURS_ONLY' ) && CLI_NOTICE_BUSINESS_HOURS_ONLY;
+        // Current authentication status
+        WP_CLI::log( '' );
+        WP_CLI::log( __( 'Current Authentication:', 'cli-dashboard-notice' ) );
+        WP_CLI::log( sprintf( __( 'Authentication Tier: %s', 'cli-dashboard-notice' ), $status['current_auth_tier'] ) );
         
-        WP_CLI::log( sprintf( __( 'Environment CLI Enable: %s', 'cli-dashboard-notice' ), $env_enabled ? 'Yes' : 'No' ) );
-        WP_CLI::log( sprintf( __( 'Constant CLI Enable: %s', 'cli-dashboard-notice' ), $const_enabled ? 'Yes' : 'No' ) );
-        WP_CLI::log( sprintf( __( 'IP Restrictions (ENV): %s', 'cli-dashboard-notice' ), $allowed_ips ?: 'None' ) );
-        WP_CLI::log( sprintf( __( 'IP Restrictions (CONST): %s', 'cli-dashboard-notice' ), $const_ips ?: 'None' ) );
-        WP_CLI::log( sprintf( __( 'Business Hours Only (ENV): %s', 'cli-dashboard-notice' ), $business_hours ? 'Yes' : 'No' ) );
-        WP_CLI::log( sprintf( __( 'Business Hours Only (CONST): %s', 'cli-dashboard-notice' ), $const_business ? 'Yes' : 'No' ) );
-        
-        // Current user context
-        $current_user = wp_get_current_user();
-        if ( $current_user->exists() ) {
-            WP_CLI::log( sprintf( __( 'WordPress User: %s (ID: %d)', 'cli-dashboard-notice' ), $current_user->user_login, $current_user->ID ) );
-            WP_CLI::log( sprintf( __( 'Can Manage Options: %s', 'cli-dashboard-notice' ), current_user_can( 'manage_options' ) ? 'Yes' : 'No' ) );
+        if ( $status['has_wp_user'] ) {
+            WP_CLI::log( sprintf( __( 'WordPress User: %s', 'cli-dashboard-notice' ), $status['wp_user_login'] ) );
+            WP_CLI::log( sprintf( __( 'Can Manage Options: %s', 'cli-dashboard-notice' ), $status['can_manage_options'] ? 'Yes' : 'No' ) );
         } else {
             WP_CLI::log( __( 'WordPress User: No user context', 'cli-dashboard-notice' ) );
-        }
-        
-        // System user
-        if ( function_exists( 'posix_getpwuid' ) && function_exists( 'posix_geteuid' ) ) {
-            $system_user = posix_getpwuid( posix_geteuid() )['name'] ?? 'unknown';
-            WP_CLI::log( sprintf( __( 'System User: %s', 'cli-dashboard-notice' ), $system_user ) );
-        }
-        
-        // Log file locations
-        WP_CLI::log( '' );
-        WP_CLI::log( __( 'Logging Configuration:', 'cli-dashboard-notice' ) );
-        
-        if ( defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG ) {
-            $log_file = defined( 'WP_CONTENT_DIR' ) ? WP_CONTENT_DIR . '/debug.log' : 'wp-content/debug.log';
-            WP_CLI::log( sprintf( __( 'WordPress Debug Log: %s', 'cli-dashboard-notice' ), $log_file ) );
-        } else {
-            WP_CLI::log( __( 'WordPress Debug Log: Disabled', 'cli-dashboard-notice' ) );
-        }
-        
-        if ( defined( 'CLI_NOTICE_LOG_FILE' ) ) {
-            WP_CLI::log( sprintf( __( 'Custom Log File: %s', 'cli-dashboard-notice' ), CLI_NOTICE_LOG_FILE ) );
-        } else {
-            WP_CLI::log( __( 'Custom Log File: Not configured', 'cli-dashboard-notice' ) );
         }
         
         // Security recommendations
         WP_CLI::log( '' );
         WP_CLI::log( __( 'Security Recommendations:', 'cli-dashboard-notice' ) );
         
-        if ( ! $env_enabled && ! $const_enabled ) {
+        if ( ! $status['cli_enabled'] ) {
             WP_CLI::log( __( '✅ CLI bypass disabled - Maximum security', 'cli-dashboard-notice' ) );
             WP_CLI::log( __( '   Use --allow-cli flag for write operations', 'cli-dashboard-notice' ) );
         } else {
             WP_CLI::warning( __( '⚠️ CLI bypass enabled - Review security settings', 'cli-dashboard-notice' ) );
             
-            if ( empty( $allowed_ips ) && empty( $const_ips ) ) {
+            if ( ! $status['ip_restrictions_active'] ) {
                 WP_CLI::warning( __( '⚠️ No IP restrictions - Consider adding IP whitelist', 'cli-dashboard-notice' ) );
             }
             
-            if ( ! $business_hours && ! $const_business ) {
+            if ( ! $status['business_hours_active'] ) {
                 WP_CLI::log( __( '💡 Consider enabling business hours restrictions', 'cli-dashboard-notice' ) );
             }
         }
         
-        CLI_Dashboard_Notice::cli_audit_log( 'Security status checked' );
+        if ( $status['server_key_configured'] ) {
+            WP_CLI::log( __( '✅ Server key authentication available', 'cli-dashboard-notice' ) );
+        } else {
+            WP_CLI::log( __( '💡 Consider setting up server key authentication', 'cli-dashboard-notice' ) );
+            WP_CLI::log( __( '   Run: wp notice generate-key --confirm', 'cli-dashboard-notice' ) );
+        }
+        
+        CLI_Dashboard_Notice::cli_audit_log( 'Security status checked (authenticated)' );
+    }
+    
+    /**
+     * Get sanitized security status (no sensitive information)
+     *
+     * @return array Sanitized security configuration
+     */
+    private function get_sanitized_security_status() {
+        // Check CLI bypass status
+        $env_enabled = getenv( 'CLI_NOTICE_ENABLE' ) === '1';
+        $const_enabled = defined( 'CLI_NOTICE_ENABLE' ) && CLI_NOTICE_ENABLE;
+        $cli_enabled = $env_enabled || $const_enabled;
+        
+        // Check restrictions (but don't reveal actual values)
+        $allowed_ips_env = getenv( 'CLI_NOTICE_ALLOWED_IPS' );
+        $allowed_ips_const = defined( 'CLI_NOTICE_ALLOWED_IPS' ) ? CLI_NOTICE_ALLOWED_IPS : null;
+        $ip_restrictions_active = ! empty( $allowed_ips_env ) || ! empty( $allowed_ips_const );
+        
+        $business_hours_env = getenv( 'CLI_NOTICE_BUSINESS_HOURS_ONLY' ) === '1';
+        $business_hours_const = defined( 'CLI_NOTICE_BUSINESS_HOURS_ONLY' ) && CLI_NOTICE_BUSINESS_HOURS_ONLY;
+        $business_hours_active = $business_hours_env || $business_hours_const;
+        
+        // Check logging (but don't reveal file paths)
+        $debug_log_enabled = defined( 'WP_DEBUG_LOG' ) && WP_DEBUG_LOG;
+        $custom_log_enabled = defined( 'CLI_NOTICE_LOG_FILE' );
+        $audit_logging_active = $debug_log_enabled || $custom_log_enabled;
+        
+        // Current user context
+        $current_user = wp_get_current_user();
+        $has_wp_user = $current_user->exists();
+        $can_manage_options = $has_wp_user && current_user_can( 'manage_options' );
+        
+        // Determine current authentication tier
+        $current_auth_tier = 'None';
+        if ( $has_wp_user && $can_manage_options ) {
+            $current_auth_tier = 'WordPress User';
+        } elseif ( CLI_Dashboard_Notice::validate_server_key() ) {
+            $current_auth_tier = 'Server Key';
+        } elseif ( $cli_enabled ) {
+            $current_auth_tier = 'CLI Bypass';
+        }
+        
+        return [
+            'cli_enabled' => $cli_enabled,
+            'server_key_configured' => CLI_Dashboard_Notice::has_server_key(),
+            'ip_restrictions_active' => $ip_restrictions_active,
+            'business_hours_active' => $business_hours_active,
+            'audit_logging_active' => $audit_logging_active,
+            'has_wp_user' => $has_wp_user,
+            'wp_user_login' => $has_wp_user ? $current_user->user_login : null,
+            'can_manage_options' => $can_manage_options,
+            'current_auth_tier' => $current_auth_tier
+        ];
     }
     
     /**
@@ -1416,6 +1649,100 @@ class CLI_Notice_Command {
         CLI_Dashboard_Notice::cli_audit_log( 'CLI bypass configuration displayed', [
             'ip_whitelist' => $assoc['ip-whitelist'] ?? 'none',
             'business_hours' => isset( $assoc['business-hours-only'] ),
+            'user_id' => get_current_user_id()
+        ] );
+    }
+    
+    /**
+     * Generate a new server key for CLI authentication.
+     *
+     * @synopsis [--confirm]
+     */
+    public function generate_key( $args, $assoc ) {
+        if ( ! isset( $assoc['confirm'] ) ) {
+            WP_CLI::error( __( 'This command generates a new server key. Use --confirm flag to proceed.', 'cli-dashboard-notice' ) );
+        }
+        
+        // Check current user has permission to modify security settings
+        if ( ! current_user_can( 'manage_options' ) ) {
+            WP_CLI::error( __( 'You must have manage_options capability to generate server keys.', 'cli-dashboard-notice' ) );
+        }
+        
+        // Check if server key already exists
+        if ( CLI_Dashboard_Notice::has_server_key() ) {
+            WP_CLI::warning( __( 'A server key already exists. This will replace the existing key.', 'cli-dashboard-notice' ) );
+        }
+        
+        // Generate new server key
+        $server_key = CLI_Dashboard_Notice::generate_server_key();
+        
+        WP_CLI::success( __( 'Server key generated successfully!', 'cli-dashboard-notice' ) );
+        WP_CLI::log( '' );
+        WP_CLI::log( __( 'To use the server key for CLI authentication, run:', 'cli-dashboard-notice' ) );
+        WP_CLI::log( '' );
+        WP_CLI::log( sprintf( 'export %s="%s"', CLI_Dashboard_Notice::SERVER_KEY_ENV_VAR, $server_key ) );
+        WP_CLI::log( '' );
+        WP_CLI::log( __( 'Then use wp notice commands normally without --allow-cli flag.', 'cli-dashboard-notice' ) );
+        WP_CLI::log( '' );
+        WP_CLI::warning( __( 'IMPORTANT: Save this key securely - it cannot be recovered!', 'cli-dashboard-notice' ) );
+        
+        // Write to temporary file for secure retrieval
+        $temp_file = sys_get_temp_dir() . '/cli_notice_server_key_' . time() . '.txt';
+        if ( file_put_contents( $temp_file, $server_key, LOCK_EX ) ) {
+            chmod( $temp_file, 0600 );
+            WP_CLI::log( sprintf( __( 'Key also saved to temporary file: %s', 'cli-dashboard-notice' ), $temp_file ) );
+        }
+    }
+    
+    /**
+     * Check server key status and configuration.
+     */
+    public function key_status() {
+        if ( CLI_Dashboard_Notice::has_server_key() ) {
+            WP_CLI::success( __( 'Server key is configured.', 'cli-dashboard-notice' ) );
+            
+            // Test if current environment has valid key
+            if ( CLI_Dashboard_Notice::validate_server_key() ) {
+                WP_CLI::log( __( '✓ Current environment has valid server key', 'cli-dashboard-notice' ) );
+            } else {
+                WP_CLI::log( sprintf( 
+                    __( '✗ No valid server key in environment variable %s', 'cli-dashboard-notice' ),
+                    CLI_Dashboard_Notice::SERVER_KEY_ENV_VAR
+                ) );
+            }
+        } else {
+            WP_CLI::error( __( 'No server key is configured. Run "wp notice generate-key --confirm" to create one.', 'cli-dashboard-notice' ) );
+        }
+        
+        CLI_Dashboard_Notice::cli_audit_log( 'Server key status checked' );
+    }
+    
+    /**
+     * Remove the server key (disables server key authentication).
+     *
+     * @synopsis [--confirm]
+     */
+    public function remove_key( $args, $assoc ) {
+        if ( ! isset( $assoc['confirm'] ) ) {
+            WP_CLI::error( __( 'This command removes the server key. Use --confirm flag to proceed.', 'cli-dashboard-notice' ) );
+        }
+        
+        // Check current user has permission to modify security settings
+        if ( ! current_user_can( 'manage_options' ) ) {
+            WP_CLI::error( __( 'You must have manage_options capability to remove server keys.', 'cli-dashboard-notice' ) );
+        }
+        
+        if ( ! CLI_Dashboard_Notice::has_server_key() ) {
+            WP_CLI::error( __( 'No server key is currently configured.', 'cli-dashboard-notice' ) );
+        }
+        
+        // Remove the server key
+        delete_option( CLI_Dashboard_Notice::SERVER_KEY_OPTION );
+        
+        WP_CLI::success( __( 'Server key removed successfully.', 'cli-dashboard-notice' ) );
+        WP_CLI::warning( __( 'CLI operations will now require --allow-cli flag or WordPress user context.', 'cli-dashboard-notice' ) );
+        
+        CLI_Dashboard_Notice::cli_audit_log( 'Server key removed', [
             'user_id' => get_current_user_id()
         ] );
     }
